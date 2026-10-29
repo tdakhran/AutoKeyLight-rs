@@ -9,16 +9,16 @@ which is MIT licensed. Thanks Gabriel!
 
 ## Features
 
-- Runs in the tray, click the icon to open the settings window
+- Runs in the tray (the menu bar on macOS), click the icon to open the settings window
 - Turns the lights on as soon as any app starts streaming from a camera, and off when it stops. Apps that only open
   the camera to list it don't count
 - The lights are only switched when the camera turns on or off, so lights you switch yourself stay that way, for
   example turning them on without a call
 - Optional delays before turning the lights on or off
 - The settings window shows which cameras are in use, and each light's name, IP and whether it's on, off or
-  unreachable
+  unreachable. It sizes itself to its content
 - **Track** or **Untrack** each light to choose which ones follow the camera. New lights are tracked
-- Event driven, no polling in the background: Windows notifies the app when the camera turns on or off, and lights are
+- Event driven, no polling in the background: the system notifies the app when the camera turns on or off, and lights are
   only asked for their state while the settings window is open, on a separate thread so a slow light never delays
   anything. With the window closed, the app does nothing at all until the camera changes
 - If a light doesn't respond when the camera changes, it's retried once a second later, and an unreachable light
@@ -33,8 +33,9 @@ which is MIT licensed. Thanks Gabriel!
 
 | | Windows | macOS | Linux |
 |---|---|---|---|
-| Tray app and settings | ✅ | Not tested yet | Not tested yet |
-| Camera detection | ✅ Media Foundation | Not yet, planned with CoreMediaIO | Not yet |
+| Tray app and settings | ✅ | ✅ | Not tested yet |
+| Camera detection | ✅ Media Foundation | ✅ CoreMediaIO | Not yet |
+| Tested on | Windows 11 26300 | macOS 26.4, Apple silicon | |
 
 Without camera detection the app runs but never switches the lights, the settings window says so.
 
@@ -42,6 +43,10 @@ On Windows, camera usage is detected with the Media Foundation
 [sensor activity monitor](https://learn.microsoft.com/en-us/windows/win32/api/mfidl/nn-mfidl-imfsensoractivitymonitor).
 Windows 11 builds 26200 and newer no longer record camera usage in the registry, which is what older versions of
 the original app relied on.
+
+On macOS, the app listens to each camera's "running somewhere" property in
+[CoreMediaIO](https://developer.apple.com/documentation/coremediaio), which is set while any app streams from it.
+Cameras that are plugged in later are picked up too. macOS doesn't say which app is using the camera, only that one is.
 
 ## Finding lights
 
@@ -62,8 +67,18 @@ under **Advanced settings** → **Inbound Rules**, delete those and start the ap
 
 Windows asks again whenever the exe is moved or replaced by a new version at a different path.
 
-Debug builds write a timing log to `autokeylight.log` in the temp directory, showing camera events, discovered lights
-and how long each request to a light took.
+### macOS Local Network permission
+
+macOS asks whether AutoKeyLight may **find and connect to devices on your local network** the first time it looks for
+lights. Click **Allow**, the lights won't be found otherwise. If it was denied, turn AutoKeyLight on under
+**System Settings** → **Privacy & Security** → **Local Network**.
+
+The permission belongs to the exact binary, so builds that aren't code signed ask again after every rebuild.
+
+## Debug log
+
+Debug builds write a timing log to `autokeylight.log` in the temp directory (`%TEMP%` on Windows, `$TMPDIR` on macOS),
+showing camera events, discovered lights and how long each request to a light took.
 
 ## Building
 
@@ -97,6 +112,24 @@ cargo build --release
 The exe ends up in `target\release\autokeylight.exe`. If the code lives in WSL, clone it to a Windows drive first,
 building from a `\\wsl.localhost\...` path is slow and some build scripts don't handle it.
 
+### Building on macOS
+
+Install the Xcode Command Line Tools and Rust, then build:
+
+```sh
+xcode-select --install
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+cargo build --release
+```
+
+`cargo tauri build` creates `AutoKeyLight.app` and a `.dmg`.
+
+To try a build over SSH, a user has to be logged in to the desktop, and the app has to be started inside that session
+with `open`, which needs an app bundle. A minimal one is enough: the binary in `AutoKeyLight.app/Contents/MacOS/`
+and an `Info.plist` with `CFBundleExecutable` set to `autokeylight` and `LSUIElement` set to true, so the app stays
+out of the Dock. Apps started over SSH can't use the camera themselves, but `open -a "Photo Booth"` streams from it
+in the desktop session.
+
 ### Cross-compiling for Windows from Linux
 
 With the MinGW toolchain installed (`mingw-w64-gcc` on Arch, `mingw-w64` on Debian/Ubuntu):
@@ -122,6 +155,7 @@ src/
   camera/
     mod.rs                      platform independent entry point
     media_foundation.rs         Windows camera detection
+    core_media_io.rs            macOS camera detection
 ui/                             settings window (plain HTML, CSS and JS, no build step)
 ```
 

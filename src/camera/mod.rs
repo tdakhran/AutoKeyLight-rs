@@ -1,5 +1,7 @@
 //! Detects whether any app is currently streaming from a camera.
 
+#[cfg(target_os = "macos")]
+mod core_media_io;
 #[cfg(windows)]
 mod media_foundation;
 
@@ -11,7 +13,10 @@ pub fn spawn_monitor(on_change: impl Fn(Vec<String>) + Send + Sync + 'static) ->
     #[cfg(windows)]
     return media_foundation::spawn_monitor(Box::new(on_change));
 
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
+    return core_media_io::spawn_monitor(Box::new(on_change));
+
+    #[cfg(not(any(windows, target_os = "macos")))]
     {
         let _ = on_change;
         false

@@ -22,6 +22,8 @@ use settings::Settings;
 /// Passed when started at login, so the app starts in the tray
 const MINIMIZED_ARG: &str = "--minimized";
 const TRAY_ICON: &[u8] = include_bytes!("../icons/tray.png");
+/// Matches the width in tauri.conf.json, the window only ever changes height
+const WINDOW_WIDTH: f64 = 360.0;
 
 #[tauri::command]
 fn get_settings(shared: State<'_, Arc<Shared>>) -> Settings {
@@ -57,14 +59,25 @@ fn set_autostart(app: AppHandle, enabled: bool) -> Result<(), String> {
     result.map_err(|error| error.to_string())
 }
 
-/// Resizes the window to the height of its content, keeping the width
+/// Grows or shrinks the window by `difference`, the content height minus the height the page actually has.
+/// Measured by the page, because what the window size covers differs between platforms, on macOS it includes
+/// the title bar.
 #[tauri::command]
-fn fit_window(window: WebviewWindow, height: f64) -> Result<(), String> {
-    let size = window.inner_size().map_err(|error| error.to_string())?;
+fn fit_window(window: WebviewWindow, difference: f64) -> Result<(), String> {
     let scale = window.scale_factor().map_err(|error| error.to_string())?;
-    let width = size.to_logical::<f64>(scale).width;
+    let height = window.inner_size().map_err(|error| error.to_string())?.to_logical::<f64>(scale).height;
+    let size = LogicalSize::new(WINDOW_WIDTH, height + difference);
 
-    window.set_size(LogicalSize::new(width, height)).map_err(|error| error.to_string())
+    // macOS ignores resizing a window that isn't resizable, so allow it just for this. Not on Windows, where it
+    // changes the frame thickness and with it the size
+    if cfg!(target_os = "macos") {
+        let _ = window.set_resizable(true);
+        let result = window.set_size(size);
+        let _ = window.set_resizable(false);
+        result.map_err(|error| error.to_string())
+    } else {
+        window.set_size(size).map_err(|error| error.to_string())
+    }
 }
 
 fn notify(app: &AppHandle, event: Event) {

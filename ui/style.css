@@ -155,6 +155,14 @@ input[type="number"] {
 input[type="number"] {
   width: 80px;
   text-align: right;
+  appearance: textfield;
+}
+
+/* No spinner arrows, they crowd the field on macOS */
+input[type="number"]::-webkit-inner-spin-button,
+input[type="number"]::-webkit-outer-spin-button {
+  appearance: none;
+  margin: 0;
 }
 
 input:focus {
@@ -174,6 +182,16 @@ button {
 
 button:hover {
   border-color: var(--accent);
+}
+
+/* Focus rings only for keyboard navigation, not after clicking */
+button:focus:not(:focus-visible) {
+  outline: none;
+}
+
+button:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
 }
 
 button.small {

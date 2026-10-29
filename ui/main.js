@@ -134,11 +134,30 @@ $("autostart").addEventListener("change", async (event) => {
   $("autostart").checked = await invoke("get_autostart");
 });
 
-// Size the window to its content
+// Size the window to its content. Checked again after every resize, until the page has exactly the content's height
 const content = document.querySelector("main");
+
+// Gives up after a few tries without the content changing, rather than resizing forever if it never settles
+const MAX_FIT_ATTEMPTS = 3;
+let fitAttempts = 0;
+
+function fitWindow() {
+  const difference = Math.ceil(content.getBoundingClientRect().height) - window.innerHeight;
+  if (difference === 0) {
+    fitAttempts = 0;
+    return;
+  }
+
+  if (fitAttempts >= MAX_FIT_ATTEMPTS) return;
+  fitAttempts++;
+  invoke("fit_window", { difference }).catch(() => {});
+}
+
 new ResizeObserver(() => {
-  invoke("fit_window", { height: Math.ceil(content.getBoundingClientRect().height) }).catch(() => {});
+  fitAttempts = 0;
+  fitWindow();
 }).observe(content);
+window.addEventListener("resize", fitWindow);
 
 listen("status", (event) => {
   status = event.payload;
