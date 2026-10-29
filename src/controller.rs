@@ -19,6 +19,7 @@ pub const TRAY_ICON_LIT: &[u8] = include_bytes!("../icons/tray-lit.png");
 pub const TRAY_ICON_UNLIT: &[u8] = include_bytes!("../icons/tray-unlit.png");
 
 const TICK: Duration = Duration::from_secs(1);
+const RETRY_DELAY: Duration = Duration::from_secs(1);
 
 #[derive(Clone, Copy, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -83,8 +84,16 @@ fn run(app: AppHandle, shared: Arc<Shared>, camera: Option<Arc<AtomicBool>>) {
 
         if camera_changed_at.elapsed() >= Duration::from_millis(delay_ms) {
             if settings.allow_manual_override {
-                // Only switch when the camera changed state, if a light didn't respond it's retried on the next tick
-                if is_camera_on != lights_camera_state && lights.set_all_on(&settings.lights, is_camera_on) {
+                // Only switch when the camera changed state
+                if is_camera_on != lights_camera_state {
+                    let failed = lights.set_all_on(&settings.lights, is_camera_on);
+
+                    // Retry once, only the lights that didn't respond, then leave them until the camera changes again
+                    if !failed.is_empty() {
+                        thread::sleep(RETRY_DELAY);
+                        lights.set_all_on(&failed, is_camera_on);
+                    }
+
                     lights_camera_state = is_camera_on;
                 }
             } else if let Some(light_states) = &light_states {

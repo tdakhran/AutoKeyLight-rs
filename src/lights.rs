@@ -75,15 +75,18 @@ impl Lights {
         })
     }
 
-    /// Switches all lights in parallel, returns whether every light accepted the change.
-    pub fn set_all_on(&self, addresses: &[String], on: bool) -> bool {
+    /// Switches all lights in parallel, returns the ones that didn't accept the change.
+    pub fn set_all_on(&self, addresses: &[String], on: bool) -> Vec<String> {
         thread::scope(|scope| {
             let handles: Vec<_> = addresses
                 .iter()
-                .map(|address| scope.spawn(move || self.set_on(address, on)))
+                .map(|address| (address, scope.spawn(move || self.set_on(address, on))))
                 .collect();
 
-            handles.into_iter().all(|handle| handle.join().unwrap_or(false))
+            handles
+                .into_iter()
+                .filter_map(|(address, handle)| (!handle.join().unwrap_or(false)).then(|| address.clone()))
+                .collect()
         })
     }
 }

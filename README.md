@@ -21,7 +21,8 @@ which is MIT licensed. Thanks Gabriel!
 - Quiet on the network: lights are only asked for their state while the settings window is open, or in the default
   mode where it's needed to keep them in sync. With manual override on and the window closed, the app only talks to
   the lights when the camera turns on or off
-- Lights that don't respond are retried every second, and an unreachable light doesn't hold up the others
+- If a light doesn't respond when the camera changes, it's retried once a second later, and an unreachable light
+  doesn't hold up the others
 - Start at login, in the tray
 - Closing the window keeps the app running in the tray, **Exit** in the tray menu quits it
 - Only one copy runs at a time, starting it again opens the running one
