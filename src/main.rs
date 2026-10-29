@@ -6,7 +6,7 @@ mod controller;
 mod lights;
 mod settings;
 
-use std::sync::{Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex};
 
 use tauri::image::Image;
 use tauri::menu::{Menu, MenuItem};
@@ -14,7 +14,7 @@ use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent}
 use tauri::{AppHandle, Manager, State, WindowEvent};
 use tauri_plugin_autostart::{MacosLauncher, ManagerExt};
 
-use controller::{Shared, Status};
+use controller::{Event, Shared, Status};
 use settings::Settings;
 
 /// Passed when started at login, so the app starts in the tray
@@ -30,6 +30,7 @@ fn update_settings(shared: State<'_, Arc<Shared>>, settings: Settings) -> Result
     let settings = settings.normalized();
     settings.save(&shared.settings_path).map_err(|error| error.to_string())?;
     *shared.settings.lock().unwrap() = settings.clone();
+    let _ = shared.events.send(Event::SettingsChanged);
 
     Ok(settings)
 }
@@ -52,11 +53,18 @@ fn set_autostart(app: AppHandle, enabled: bool) -> Result<(), String> {
     result.map_err(|error| error.to_string())
 }
 
+fn notify(app: &AppHandle, event: Event) {
+    if let Some(shared) = app.try_state::<Arc<Shared>>() {
+        let _ = shared.events.send(event);
+    }
+}
+
 fn show_main_window(app: &AppHandle) {
     if let Some(window) = app.get_webview_window(controller::MAIN_WINDOW) {
         let _ = window.unminimize();
         let _ = window.show();
         let _ = window.set_focus();
+        notify(app, Event::WindowShown);
     }
 }
 
@@ -93,17 +101,23 @@ fn main() {
         .invoke_handler(tauri::generate_handler![get_settings, update_settings, get_status, get_autostart, set_autostart])
         .setup(|app| {
             let settings_path = app.path().app_config_dir()?.join("settings.json");
-            let camera = camera::spawn_monitor();
+            let (events, events_receiver) = mpsc::channel();
+
+            let camera_events = events.clone();
+            let camera_supported = camera::spawn_monitor(move |on| {
+                let _ = camera_events.send(Event::Camera(on));
+            });
 
             let shared = Arc::new(Shared {
                 settings: Mutex::new(Settings::load(&settings_path)),
-                status: Mutex::new(Status { camera_supported: camera.is_some(), ..Status::default() }),
+                status: Mutex::new(Status { camera_supported, ..Status::default() }),
                 settings_path,
+                events,
             });
             app.manage(shared.clone());
 
             build_tray(app.handle())?;
-            controller::spawn(app.handle().clone(), shared, camera);
+            controller::spawn(app.handle().clone(), shared, camera_supported, events_receiver);
 
             if !std::env::args().any(|arg| arg == MINIMIZED_ARG) {
                 show_main_window(app.handle());
@@ -116,6 +130,7 @@ fn main() {
             if let WindowEvent::CloseRequested { api, .. } = event {
                 api.prevent_close();
                 let _ = window.hide();
+                notify(window.app_handle(), Event::WindowHidden);
             }
         })
         .run(tauri::generate_context!())

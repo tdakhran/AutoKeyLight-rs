@@ -1,14 +1,18 @@
-//! Background loop that follows the camera state and switches the lights.
+//! Event driven loop that follows the camera state and switches the lights.
+//!
+//! The loop sleeps until something happens: the camera turns on or off, the window is shown or hidden,
+//! the settings change, or a deadline passes (an on/off delay, or refreshing the light states while they're needed).
+//! With manual override on and the window closed, it does nothing until the camera changes.
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
 use tauri::image::Image;
-use tauri::{AppHandle, Emitter, Manager};
+use tauri::{AppHandle, Emitter};
 
 use crate::lights::Lights;
 use crate::settings::Settings;
@@ -18,10 +22,19 @@ pub const TRAY_ID: &str = "main";
 pub const TRAY_ICON_LIT: &[u8] = include_bytes!("../icons/tray-lit.png");
 pub const TRAY_ICON_UNLIT: &[u8] = include_bytes!("../icons/tray-unlit.png");
 
-const TICK: Duration = Duration::from_secs(1);
+/// How often light states are refreshed while they're needed
+const REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 const RETRY_DELAY: Duration = Duration::from_secs(1);
 
-#[derive(Clone, Copy, Serialize)]
+pub enum Event {
+    /// Whether any camera is streaming, sent when it changes
+    Camera(bool),
+    WindowShown,
+    WindowHidden,
+    SettingsChanged,
+}
+
+#[derive(Clone, Copy, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum LightState {
     /// Not checked, lights are only queried while they're needed
@@ -50,101 +63,178 @@ pub struct Shared {
     pub settings: Mutex<Settings>,
     pub status: Mutex<Status>,
     pub settings_path: PathBuf,
+    pub events: Sender<Event>,
 }
 
-pub fn spawn(app: AppHandle, shared: Arc<Shared>, camera: Option<Arc<AtomicBool>>) {
+pub fn spawn(app: AppHandle, shared: Arc<Shared>, camera_supported: bool, events: Receiver<Event>) {
+    let controller = Controller {
+        app,
+        shared,
+        lights: Lights::new(),
+        camera_supported,
+        camera_on: false,
+        camera_changed_at: Instant::now(),
+        lights_camera_state: false,
+        window_open: false,
+        next_refresh: Instant::now(),
+        light_states: Vec::new(),
+    };
+
     thread::Builder::new()
         .name("controller".into())
-        .spawn(move || run(app, shared, camera))
+        .spawn(move || controller.run(events))
         .expect("failed to spawn controller thread");
 }
 
-fn run(app: AppHandle, shared: Arc<Shared>, camera: Option<Arc<AtomicBool>>) {
-    let lights = Lights::new();
-    let mut is_camera_on = false;
-    let mut camera_changed_at = Instant::now();
-    // Camera state the lights were last switched for, starts as off so the lights are only touched once the camera turns on
-    let mut lights_camera_state = false;
+struct Controller {
+    app: AppHandle,
+    shared: Arc<Shared>,
+    lights: Lights,
+    camera_supported: bool,
+    camera_on: bool,
+    camera_changed_at: Instant,
+    /// Camera state the lights were last switched for, starts as off so the lights are only touched once the camera turns on
+    lights_camera_state: bool,
+    window_open: bool,
+    next_refresh: Instant,
+    /// Last queried light states
+    light_states: Vec<LightStatus>,
+}
 
-    loop {
-        let settings = shared.settings.lock().unwrap().clone();
-        let camera_on = camera.as_ref().is_some_and(|streaming| streaming.load(Ordering::Relaxed));
+impl Controller {
+    fn run(mut self, events: Receiver<Event>) {
+        loop {
+            let settings = self.shared.settings.lock().unwrap().clone();
+            self.update(&settings);
 
-        if camera_on != is_camera_on {
-            is_camera_on = camera_on;
-            camera_changed_at = Instant::now();
-            update_tray(&app, is_camera_on);
-        }
+            let event = match self.next_deadline(&settings) {
+                Some(deadline) => match events.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+                    Ok(event) => Some(event),
+                    Err(RecvTimeoutError::Timeout) => None,
+                    Err(RecvTimeoutError::Disconnected) => return,
+                },
+                None => match events.recv() {
+                    Ok(event) => Some(event),
+                    Err(_) => return,
+                },
+            };
 
-        // Light states are only needed to show them in the window, and for forced mode to find the lights that don't match
-        let light_states = (is_window_open(&app) || !settings.allow_manual_override)
-            .then(|| lights.are_on(&settings.lights));
-
-        let delay_ms = if is_camera_on { settings.camera_on_delay_ms } else { settings.camera_off_delay_ms };
-
-        if camera_changed_at.elapsed() >= Duration::from_millis(delay_ms) {
-            if settings.allow_manual_override {
-                // Only switch when the camera changed state
-                if is_camera_on != lights_camera_state {
-                    let failed = lights.set_all_on(&settings.lights, is_camera_on);
-
-                    // Retry once, only the lights that didn't respond, then leave them until the camera changes again
-                    if !failed.is_empty() {
-                        thread::sleep(RETRY_DELAY);
-                        lights.set_all_on(&failed, is_camera_on);
-                    }
-
-                    lights_camera_state = is_camera_on;
-                }
-            } else if let Some(light_states) = &light_states {
-                // Force the lights to follow the camera, only sending requests to the ones that don't match
-                let mismatched: Vec<String> = settings
-                    .lights
-                    .iter()
-                    .zip(light_states)
-                    .filter(|(_, on)| **on != Some(is_camera_on))
-                    .map(|(address, _)| address.clone())
-                    .collect();
-
-                lights.set_all_on(&mismatched, is_camera_on);
-                lights_camera_state = is_camera_on;
+            if let Some(event) = event {
+                self.handle(event);
             }
         }
+    }
 
-        let states: Vec<LightState> = match light_states {
-            Some(light_states) => light_states
-                .into_iter()
-                .map(|on| match on {
-                    Some(true) => LightState::On,
-                    Some(false) => LightState::Off,
-                    None => LightState::Unreachable,
-                })
-                .collect(),
-            None => vec![LightState::Unknown; settings.lights.len()],
-        };
+    fn handle(&mut self, event: Event) {
+        match event {
+            Event::Camera(on) => {
+                if on != self.camera_on {
+                    self.camera_on = on;
+                    self.camera_changed_at = Instant::now();
+                    update_tray(&self.app, on);
+                }
+            }
+            Event::WindowShown => {
+                self.window_open = true;
+                self.next_refresh = Instant::now();
+            }
+            Event::WindowHidden => self.window_open = false,
+            // Query right away so added lights show up
+            Event::SettingsChanged => self.next_refresh = Instant::now(),
+        }
+    }
+
+    /// Light states are only needed to show them in the window, and for forced mode to find the lights that don't match
+    fn needs_light_states(&self, settings: &Settings) -> bool {
+        self.window_open || !settings.allow_manual_override
+    }
+
+    /// When the lights should be switched to the camera state, if they haven't been yet
+    fn switch_deadline(&self, settings: &Settings) -> Option<Instant> {
+        let delay_ms = if self.camera_on { settings.camera_on_delay_ms } else { settings.camera_off_delay_ms };
+
+        (self.camera_on != self.lights_camera_state)
+            .then(|| self.camera_changed_at + Duration::from_millis(delay_ms))
+    }
+
+    fn next_deadline(&self, settings: &Settings) -> Option<Instant> {
+        let refresh = self.needs_light_states(settings).then_some(self.next_refresh);
+
+        [self.switch_deadline(settings), refresh].into_iter().flatten().min()
+    }
+
+    fn update(&mut self, settings: &Settings) {
+        if self.switch_deadline(settings).is_some_and(|deadline| Instant::now() >= deadline) {
+            let failed = self.lights.set_all_on(&settings.lights, self.camera_on);
+
+            // Retry once, only the lights that didn't respond, then leave them until the camera changes again
+            if !failed.is_empty() {
+                thread::sleep(RETRY_DELAY);
+                self.lights.set_all_on(&failed, self.camera_on);
+            }
+
+            self.lights_camera_state = self.camera_on;
+        }
+
+        if self.needs_light_states(settings) && Instant::now() >= self.next_refresh {
+            self.refresh_light_states(settings);
+            self.next_refresh = Instant::now() + REFRESH_INTERVAL;
+        }
 
         let status = Status {
-            camera_supported: camera.is_some(),
-            camera_on: is_camera_on,
+            camera_supported: self.camera_supported,
+            camera_on: self.camera_on,
             lights: settings
                 .lights
                 .iter()
-                .zip(states)
-                .map(|(address, state)| LightStatus { address: address.clone(), state })
+                .map(|address| LightStatus { address: address.clone(), state: self.light_state(address) })
                 .collect(),
         };
 
-        *shared.status.lock().unwrap() = status.clone();
-        let _ = app.emit("status", &status);
+        *self.shared.status.lock().unwrap() = status.clone();
 
-        thread::sleep(TICK);
+        if self.window_open {
+            let _ = self.app.emit("status", &status);
+        }
     }
-}
 
-fn is_window_open(app: &AppHandle) -> bool {
-    app.get_webview_window(MAIN_WINDOW).is_some_and(|window| {
-        window.is_visible().unwrap_or(false) && !window.is_minimized().unwrap_or(false)
-    })
+    fn refresh_light_states(&mut self, settings: &Settings) {
+        let states = self.lights.are_on(&settings.lights);
+
+        // Forced mode: switch back lights that don't match the camera, unless a delay is still running
+        if !settings.allow_manual_override && self.camera_on == self.lights_camera_state {
+            let mismatched: Vec<String> = settings
+                .lights
+                .iter()
+                .zip(&states)
+                .filter(|(_, on)| **on != Some(self.camera_on))
+                .map(|(address, _)| address.clone())
+                .collect();
+
+            self.lights.set_all_on(&mismatched, self.camera_on);
+        }
+
+        self.light_states = settings
+            .lights
+            .iter()
+            .zip(states)
+            .map(|(address, on)| LightStatus {
+                address: address.clone(),
+                state: match on {
+                    Some(true) => LightState::On,
+                    Some(false) => LightState::Off,
+                    None => LightState::Unreachable,
+                },
+            })
+            .collect();
+    }
+
+    fn light_state(&self, address: &str) -> LightState {
+        self.light_states
+            .iter()
+            .find(|light| light.address == address)
+            .map_or(LightState::Unknown, |light| light.state)
+    }
 }
 
 fn update_tray(app: &AppHandle, camera_on: bool) {

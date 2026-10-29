@@ -10,17 +10,17 @@ which is MIT licensed. Thanks Gabriel!
 ## Features
 
 - Runs in the tray. The tray icon lights up while the camera is on, click it to open the settings window
-- Turns the lights on when any app starts streaming from a camera, and off when it stops. Apps that only open the
-  camera to list it don't count
+- Turns the lights on as soon as any app starts streaming from a camera, and off when it stops. Apps that only open
+  the camera to list it don't count
 - Optional delays before turning the lights on or off
 - Two modes:
   - **Default**: the lights always follow the camera. If you switch a light yourself, it's switched back within a second
   - **Allow manual override**: the lights are switched once when the camera turns on or off and otherwise left alone,
     so lights you switch yourself stay that way
 - The settings window shows whether each light is on, off or unreachable, and stays on top of other windows
-- Quiet on the network: lights are only asked for their state while the settings window is open, or in the default
-  mode where it's needed to keep them in sync. With manual override on and the window closed, the app only talks to
-  the lights when the camera turns on or off
+- Event driven, no polling in the background: Windows notifies the app when the camera turns on or off. Lights are
+  only asked for their state while the settings window is open, or in the default mode where it's needed to keep them
+  in sync. With manual override on and the window closed, the app does nothing at all until the camera changes
 - If a light doesn't respond when the camera changes, it's retried once a second later, and an unreachable light
   doesn't hold up the others
 - Start at login, in the tray
@@ -98,7 +98,7 @@ which comes with Windows 11.
 ```
 src/
   main.rs                       tray, window and commands for the settings UI
-  controller.rs                 loop that follows the camera and switches the lights
+  controller.rs                 event loop that follows the camera and switches the lights
   lights.rs                     Elgato light HTTP API
   settings.rs                   settings stored as JSON in the app config directory
   camera/

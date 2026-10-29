@@ -5,7 +5,7 @@
 //! https://learn.microsoft.com/en-us/windows/win32/api/mfidl/nn-mfidl-imfsensoractivitymonitor
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Arc};
+use std::sync::mpsc;
 use std::thread;
 
 use windows::Win32::Media::MediaFoundation::{
@@ -16,15 +16,23 @@ use windows::Win32::Media::MediaFoundation::{
 use windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
 use windows_core::{implement, Ref, Result};
 
+type OnChange = Box<dyn Fn(bool) + Send + Sync>;
+
 #[implement(IMFSensorActivitiesReportCallback)]
 struct ReportCallback {
-    streaming: Arc<AtomicBool>,
+    streaming: AtomicBool,
+    on_change: OnChange,
 }
 
 impl IMFSensorActivitiesReportCallback_Impl for ReportCallback_Impl {
     fn OnActivitiesReport(&self, report: Ref<IMFSensorActivitiesReport>) -> Result<()> {
         let streaming = any_process_streaming(report.ok()?)?;
-        self.streaming.store(streaming, Ordering::Relaxed);
+
+        // Reports arrive for any change, including apps briefly opening the camera, only pass on actual changes
+        if self.streaming.swap(streaming, Ordering::Relaxed) != streaming {
+            (self.on_change)(streaming);
+        }
+
         Ok(())
     }
 }
@@ -46,12 +54,13 @@ fn any_process_streaming(report: &IMFSensorActivitiesReport) -> Result<bool> {
     Ok(false)
 }
 
-fn start_monitor(streaming: Arc<AtomicBool>) -> Result<IMFSensorActivityMonitor> {
+fn start_monitor(on_change: OnChange) -> Result<IMFSensorActivityMonitor> {
     unsafe {
         CoInitializeEx(None, COINIT_MULTITHREADED).ok()?;
         MFStartup(MF_VERSION, MFSTARTUP_FULL)?;
 
-        let callback: IMFSensorActivitiesReportCallback = ReportCallback { streaming }.into();
+        let callback: IMFSensorActivitiesReportCallback =
+            ReportCallback { streaming: AtomicBool::new(false), on_change }.into();
         let monitor = MFCreateSensorActivityMonitor(&callback)?;
         monitor.Start()?;
 
@@ -59,14 +68,12 @@ fn start_monitor(streaming: Arc<AtomicBool>) -> Result<IMFSensorActivityMonitor>
     }
 }
 
-pub fn spawn_monitor() -> Option<Arc<AtomicBool>> {
-    let streaming = Arc::new(AtomicBool::new(false));
+pub fn spawn_monitor(on_change: OnChange) -> bool {
     let (started_tx, started_rx) = mpsc::channel();
 
-    let thread_streaming = streaming.clone();
-    thread::Builder::new()
+    let spawned = thread::Builder::new()
         .name("camera-monitor".into())
-        .spawn(move || match start_monitor(thread_streaming) {
+        .spawn(move || match start_monitor(on_change) {
             Ok(_monitor) => {
                 let _ = started_tx.send(true);
 
@@ -79,8 +86,7 @@ pub fn spawn_monitor() -> Option<Arc<AtomicBool>> {
                 eprintln!("Camera monitor unavailable: {error}");
                 let _ = started_tx.send(false);
             }
-        })
-        .ok()?;
+        });
 
-    started_rx.recv().ok()?.then_some(streaming)
+    spawned.is_ok() && started_rx.recv().unwrap_or(false)
 }
