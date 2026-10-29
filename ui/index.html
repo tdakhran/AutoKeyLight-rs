@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>AutoKeyLight</title>
+    <link rel="stylesheet" href="style.css" />
+    <script src="main.js" defer></script>
+  </head>
+  <body>
+    <main>
+      <section class="status">
+        <div class="status-row">
+          <span class="dot" id="camera-dot"></span>
+          <span id="camera-state">Checking camera…</span>
+        </div>
+      </section>
+
+      <section>
+        <h2>Lights</h2>
+        <ul id="lights"></ul>
+        <p class="empty" id="no-lights" hidden>No lights yet, add one by its IP address.</p>
+        <form id="add-light">
+          <input id="new-light" type="text" placeholder="192.168.1.20 or 192.168.1.20:9123" spellcheck="false" autocomplete="off" />
+          <button type="submit">Add</button>
+        </form>
+      </section>
+
+      <section>
+        <h2>Delays</h2>
+        <label class="field">
+          <span>Before turning on</span>
+          <span class="number"><input id="on-delay" type="number" min="0" step="100" /> ms</span>
+        </label>
+        <label class="field">
+          <span>Before turning off</span>
+          <span class="number"><input id="off-delay" type="number" min="0" step="100" /> ms</span>
+        </label>
+      </section>
+
+      <section>
+        <label class="check">
+          <input id="autostart" type="checkbox" />
+          <span>Start at login</span>
+        </label>
+        <label class="check">
+          <input id="manual-override" type="checkbox" />
+          <span>Allow manual override
+            <small>Only switch the lights when the camera turns on or off, so lights you switch yourself stay that way</small>
+          </span>
+        </label>
+      </section>
+
+      <p class="error" id="error" hidden></p>
+    </main>
+  </body>
+</html>
