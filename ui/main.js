@@ -28,50 +28,76 @@ const LIGHT_STATES = {
   unknown: { text: "checking…", className: "" },
 };
 
-function lightState(address) {
-  const light = status?.lights.find((light) => light.address === address);
-  return LIGHT_STATES[light?.state ?? "unknown"];
+function setTracked(id, tracked) {
+  const untracked = settings.untrackedLights.filter((untrackedId) => untrackedId !== id);
+  saveSettings({ untrackedLights: tracked ? untracked : [...untracked, id] });
 }
 
+// Rows by light id, so status updates change them in place instead of rebuilding the list under the cursor
+const lightRows = new Map();
+let renderedLights = "";
+
 function renderLights() {
-  const list = $("lights");
-  list.replaceChildren();
+  const lights = status?.lights ?? [];
 
-  for (const address of settings.lights) {
-    const state = lightState(address);
-
-    const dot = document.createElement("span");
-    dot.className = `dot ${state.className}`;
-
-    const label = document.createElement("span");
-    label.className = "address";
-    label.textContent = address;
-    label.title = address;
-
-    const stateLabel = document.createElement("span");
-    stateLabel.className = "state";
-    stateLabel.textContent = state.text;
-
-    const remove = document.createElement("button");
-    remove.className = "remove";
-    remove.textContent = "Remove";
-    remove.addEventListener("click", () =>
-      saveSettings({ lights: settings.lights.filter((light) => light !== address) }),
-    );
-
-    const item = document.createElement("li");
-    item.append(dot, label, stateLabel, remove);
-    list.append(item);
+  // Only rebuild when lights come or go, or are tracked or untracked
+  const key = JSON.stringify(lights.map((light) => [light.id, light.name, light.address, light.tracked]));
+  if (key !== renderedLights) {
+    renderedLights = key;
+    buildLightRows(lights);
   }
 
-  $("no-lights").hidden = settings.lights.length > 0;
+  for (const light of lights) {
+    const row = lightRows.get(light.id);
+    const state = LIGHT_STATES[light.state];
+    row.dot.className = `dot ${state.className}`;
+    row.state.textContent = state.text;
+  }
+
+  $("no-lights").hidden = lights.length > 0;
+}
+
+function buildLightRows(lights) {
+  const list = $("lights");
+  list.replaceChildren();
+  lightRows.clear();
+
+  for (const light of lights) {
+    const dot = document.createElement("span");
+    dot.className = "dot";
+
+    const name = document.createElement("span");
+    name.className = "name";
+    name.textContent = light.name;
+
+    const address = document.createElement("span");
+    address.className = "address";
+    address.textContent = light.address;
+
+    const label = document.createElement("span");
+    label.className = "label";
+    label.append(name, address);
+
+    const state = document.createElement("span");
+    state.className = "state";
+
+    const track = document.createElement("button");
+    track.className = light.tracked ? "small" : "small primary";
+    track.textContent = light.tracked ? "Untrack" : "Track";
+    track.addEventListener("click", () => setTracked(light.id, !light.tracked));
+
+    const item = document.createElement("li");
+    item.classList.toggle("disabled", !light.tracked);
+    item.append(dot, label, state, track);
+    list.append(item);
+
+    lightRows.set(light.id, { dot, state });
+  }
 }
 
 function renderSettings() {
-  renderLights();
   $("on-delay").value = settings.cameraOnDelayMs;
   $("off-delay").value = settings.cameraOffDelayMs;
-  $("manual-override").checked = settings.allowManualOverride;
 }
 
 function renderStatus() {
@@ -83,10 +109,10 @@ function renderStatus() {
     text.textContent = "Camera detection isn't supported on this system";
   } else {
     dot.className = `dot ${status.cameraOn ? "on" : "off"}`;
-    text.textContent = status.cameraOn ? "Camera is on" : "Camera is off";
+    text.textContent = status.cameraOn ? `Camera is on: ${status.cameras.join(", ")}` : "Camera is off";
   }
 
-  if (settings) renderLights();
+  renderLights();
 }
 
 function readDelay(input) {
@@ -95,20 +121,8 @@ function readDelay(input) {
   return value;
 }
 
-$("add-light").addEventListener("submit", (event) => {
-  event.preventDefault();
-  const address = $("new-light").value.trim();
-  if (!address) return;
-
-  $("new-light").value = "";
-  saveSettings({ lights: [...settings.lights, address] });
-});
-
 $("on-delay").addEventListener("change", (event) => saveSettings({ cameraOnDelayMs: readDelay(event.target) }));
 $("off-delay").addEventListener("change", (event) => saveSettings({ cameraOffDelayMs: readDelay(event.target) }));
-$("manual-override").addEventListener("change", (event) =>
-  saveSettings({ allowManualOverride: event.target.checked }),
-);
 
 $("autostart").addEventListener("change", async (event) => {
   try {
@@ -119,6 +133,12 @@ $("autostart").addEventListener("change", async (event) => {
   }
   $("autostart").checked = await invoke("get_autostart");
 });
+
+// Size the window to its content
+const content = document.querySelector("main");
+new ResizeObserver(() => {
+  invoke("fit_window", { height: Math.ceil(content.getBoundingClientRect().height) }).catch(() => {});
+}).observe(content);
 
 listen("status", (event) => {
   status = event.payload;

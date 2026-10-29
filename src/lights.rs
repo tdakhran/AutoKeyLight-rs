@@ -1,12 +1,13 @@
 //! Talks to Elgato lights over their local HTTP API.
 
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 use serde_json::json;
 
-const DEFAULT_PORT: u16 = 9123;
+use crate::log::log;
+
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Deserialize)]
@@ -19,6 +20,8 @@ struct LightState {
     on: u8,
 }
 
+/// Cheap to clone, clones share the connection pool
+#[derive(Clone)]
 pub struct Lights {
     agent: ureq::Agent,
 }
@@ -33,13 +36,9 @@ impl Lights {
         Self { agent }
     }
 
-    /// Accepts `<ip>` or `<ip>:<port>`
+    /// `address` is `<ip>:<port>`
     fn url(address: &str) -> String {
-        if address.contains(':') {
-            format!("http://{address}/elgato/lights")
-        } else {
-            format!("http://{address}:{DEFAULT_PORT}/elgato/lights")
-        }
+        format!("http://{address}/elgato/lights")
     }
 
     /// Returns `None` if the light couldn't be reached.
@@ -60,7 +59,16 @@ impl Lights {
     pub fn set_on(&self, address: &str, on: bool) -> bool {
         let payload = json!({ "numberOfLights": 1, "lights": [{ "on": u8::from(on) }] });
 
-        self.agent.put(&Self::url(address)).send_json(&payload).is_ok()
+        let started = Instant::now();
+        let result = self.agent.put(&Self::url(address)).send_json(&payload);
+
+        let outcome = match &result {
+            Ok(_) => "ok".to_string(),
+            Err(error) => format!("failed: {error}"),
+        };
+        log(format_args!("lights: set {address} on={on} took {}ms, {outcome}", started.elapsed().as_millis()));
+
+        result.is_ok()
     }
 
     /// Queries all lights in parallel, so an unreachable light doesn't hold up the others.

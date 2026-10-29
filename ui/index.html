@@ -18,12 +18,9 @@
 
       <section>
         <h2>Lights</h2>
+        <p class="hint">Tracked lights turn on and off with the camera.</p>
         <ul id="lights"></ul>
-        <p class="empty" id="no-lights" hidden>No lights yet, add one by its IP address.</p>
-        <form id="add-light">
-          <input id="new-light" type="text" placeholder="192.168.1.20 or 192.168.1.20:9123" spellcheck="false" autocomplete="off" />
-          <button type="submit">Add</button>
-        </form>
+        <p class="empty" id="no-lights" hidden>Looking for lights on your network…</p>
       </section>
 
       <section>
@@ -42,12 +39,6 @@
         <label class="check">
           <input id="autostart" type="checkbox" />
           <span>Start at login</span>
-        </label>
-        <label class="check">
-          <input id="manual-override" type="checkbox" />
-          <span>Allow manual override
-            <small>Only switch the lights when the camera turns on or off, so lights you switch yourself stay that way</small>
-          </span>
         </label>
       </section>
 

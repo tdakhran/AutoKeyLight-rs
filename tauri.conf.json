@@ -16,7 +16,6 @@
         "height": 560,
         "resizable": false,
         "maximizable": false,
-        "alwaysOnTop": true,
         "visible": false,
         "center": true
       }

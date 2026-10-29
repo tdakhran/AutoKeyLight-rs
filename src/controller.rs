@@ -1,9 +1,12 @@
 //! Event driven loop that follows the camera state and switches the lights.
 //!
-//! The loop sleeps until something happens: the camera turns on or off, the window is shown or hidden,
-//! the settings change, or a deadline passes (an on/off delay, or refreshing the light states while they're needed).
-//! With manual override on and the window closed, it does nothing until the camera changes.
+//! The loop sleeps until something happens: the camera turns on or off, a light is found or lost on the network,
+//! the window is shown or hidden, the settings change, light states come back from a refresh, or a deadline passes
+//! (an on/off delay, a retry, or refreshing the light states while the window is open). With the window closed,
+//! it does nothing until the camera changes. Light states are queried on a separate thread, so a slow light never
+//! holds up the loop.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
@@ -11,33 +14,37 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
-use tauri::image::Image;
 use tauri::{AppHandle, Emitter};
 
+use crate::discovery::DiscoveredLight;
 use crate::lights::Lights;
+use crate::log::log;
 use crate::settings::Settings;
 
 pub const MAIN_WINDOW: &str = "main";
-pub const TRAY_ID: &str = "main";
-pub const TRAY_ICON_LIT: &[u8] = include_bytes!("../icons/tray-lit.png");
-pub const TRAY_ICON_UNLIT: &[u8] = include_bytes!("../icons/tray-unlit.png");
 
-/// How often light states are refreshed while they're needed
+/// How often light states are refreshed while the window is open
 const REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 const RETRY_DELAY: Duration = Duration::from_secs(1);
 
 pub enum Event {
-    /// Whether any camera is streaming, sent when it changes
-    Camera(bool),
+    /// Names of the cameras that are streaming, empty when none are, sent when it changes
+    Camera(Vec<String>),
+    LightFound(DiscoveredLight),
+    /// mDNS instance name of a light that left the network
+    LightLost(String),
     WindowShown,
     WindowHidden,
-    SettingsChanged,
+    /// Ids of lights that were just tracked, they're switched to match the other tracked lights right away
+    SettingsChanged { newly_tracked: Vec<String> },
+    /// Result of a background refresh, whether each light is on by id, `None` if it couldn't be reached
+    LightsRefreshed(Vec<(String, Option<bool>)>),
 }
 
 #[derive(Clone, Copy, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum LightState {
-    /// Not checked, lights are only queried while they're needed
+    /// Not checked, lights are only queried while the window is open
     Unknown,
     On,
     Off,
@@ -47,8 +54,11 @@ pub enum LightState {
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LightStatus {
+    pub id: String,
+    pub name: String,
     pub address: String,
     pub state: LightState,
+    pub tracked: bool,
 }
 
 #[derive(Clone, Default, Serialize)]
@@ -56,6 +66,8 @@ pub struct LightStatus {
 pub struct Status {
     pub camera_supported: bool,
     pub camera_on: bool,
+    /// Names of the cameras that are streaming
+    pub cameras: Vec<String>,
     pub lights: Vec<LightStatus>,
 }
 
@@ -71,13 +83,17 @@ pub fn spawn(app: AppHandle, shared: Arc<Shared>, camera_supported: bool, events
         app,
         shared,
         lights: Lights::new(),
+        found: Vec::new(),
         camera_supported,
         camera_on: false,
+        cameras: Vec::new(),
         camera_changed_at: Instant::now(),
         lights_camera_state: false,
+        retry: None,
         window_open: false,
+        refreshing: false,
         next_refresh: Instant::now(),
-        light_states: Vec::new(),
+        light_states: HashMap::new(),
     };
 
     thread::Builder::new()
@@ -86,19 +102,31 @@ pub fn spawn(app: AppHandle, shared: Arc<Shared>, camera_supported: bool, events
         .expect("failed to spawn controller thread");
 }
 
+/// Lights that didn't respond to a switch, retried once
+struct Retry {
+    at: Instant,
+    addresses: Vec<String>,
+}
+
 struct Controller {
     app: AppHandle,
     shared: Arc<Shared>,
     lights: Lights,
+    /// Lights found on the network, sorted by name
+    found: Vec<DiscoveredLight>,
     camera_supported: bool,
     camera_on: bool,
+    cameras: Vec<String>,
     camera_changed_at: Instant,
     /// Camera state the lights were last switched for, starts as off so the lights are only touched once the camera turns on
     lights_camera_state: bool,
+    retry: Option<Retry>,
     window_open: bool,
+    /// Whether a background refresh of the light states is running
+    refreshing: bool,
     next_refresh: Instant,
-    /// Last queried light states
-    light_states: Vec<LightStatus>,
+    /// Last queried light states by id
+    light_states: HashMap<String, LightState>,
 }
 
 impl Controller {
@@ -127,26 +155,62 @@ impl Controller {
 
     fn handle(&mut self, event: Event) {
         match event {
-            Event::Camera(on) => {
+            Event::Camera(cameras) => {
+                log(format_args!("controller: camera event {cameras:?}"));
+                let on = !cameras.is_empty();
+                self.cameras = cameras;
+
                 if on != self.camera_on {
                     self.camera_on = on;
                     self.camera_changed_at = Instant::now();
-                    update_tray(&self.app, on);
+                    // A pending retry was for the previous camera state
+                    self.retry = None;
                 }
             }
+            Event::LightFound(light) => {
+                match self.found.iter_mut().find(|found| found.id == light.id) {
+                    Some(found) => *found = light,
+                    None => self.found.push(light),
+                }
+                self.found.sort_by(|a, b| a.name.cmp(&b.name));
+                self.next_refresh = Instant::now();
+            }
+            Event::LightLost(fullname) => self.found.retain(|light| light.fullname != fullname),
             Event::WindowShown => {
                 self.window_open = true;
                 self.next_refresh = Instant::now();
             }
             Event::WindowHidden => self.window_open = false,
-            // Query right away so added lights show up
-            Event::SettingsChanged => self.next_refresh = Instant::now(),
-        }
-    }
+            Event::SettingsChanged { newly_tracked } => {
+                let addresses: Vec<String> = self
+                    .found
+                    .iter()
+                    .filter(|light| newly_tracked.contains(&light.id))
+                    .map(|light| light.address.clone())
+                    .collect();
 
-    /// Light states are only needed to show them in the window, and for forced mode to find the lights that don't match
-    fn needs_light_states(&self, settings: &Settings) -> bool {
-        self.window_open || !settings.allow_manual_override
+                if !addresses.is_empty() {
+                    log(format_args!("controller: tracking {} lights on={}", addresses.len(), self.lights_camera_state));
+                    self.lights.set_all_on(&addresses, self.lights_camera_state);
+                    self.next_refresh = Instant::now();
+                }
+            }
+            Event::LightsRefreshed(states) => {
+                self.refreshing = false;
+                self.next_refresh = Instant::now() + REFRESH_INTERVAL;
+                self.light_states = states
+                    .into_iter()
+                    .map(|(id, on)| {
+                        let state = match on {
+                            Some(true) => LightState::On,
+                            Some(false) => LightState::Off,
+                            None => LightState::Unreachable,
+                        };
+                        (id, state)
+                    })
+                    .collect();
+            }
+        }
     }
 
     /// When the lights should be switched to the camera state, if they haven't been yet
@@ -158,36 +222,60 @@ impl Controller {
     }
 
     fn next_deadline(&self, settings: &Settings) -> Option<Instant> {
-        let refresh = self.needs_light_states(settings).then_some(self.next_refresh);
+        // Light states are only needed to show them in the window
+        let refresh = (self.window_open && !self.refreshing).then_some(self.next_refresh);
+        let retry = self.retry.as_ref().map(|retry| retry.at);
 
-        [self.switch_deadline(settings), refresh].into_iter().flatten().min()
+        [self.switch_deadline(settings), retry, refresh].into_iter().flatten().min()
     }
 
     fn update(&mut self, settings: &Settings) {
+        // Show camera changes right away, before talking to the lights
+        self.publish_status(settings);
+
         if self.switch_deadline(settings).is_some_and(|deadline| Instant::now() >= deadline) {
-            let failed = self.lights.set_all_on(&settings.lights, self.camera_on);
+            let tracked: Vec<String> = self
+                .found
+                .iter()
+                .filter(|light| settings.is_tracked(&light.id))
+                .map(|light| light.address.clone())
+                .collect();
+
+            log(format_args!("controller: switching {} lights on={}", tracked.len(), self.camera_on));
+            let failed = self.lights.set_all_on(&tracked, self.camera_on);
+            self.lights_camera_state = self.camera_on;
 
             // Retry once, only the lights that didn't respond, then leave them until the camera changes again
-            if !failed.is_empty() {
-                thread::sleep(RETRY_DELAY);
-                self.lights.set_all_on(&failed, self.camera_on);
-            }
+            self.retry = (!failed.is_empty()).then(|| Retry { at: Instant::now() + RETRY_DELAY, addresses: failed });
 
-            self.lights_camera_state = self.camera_on;
+            // Show the new light states right away
+            self.next_refresh = Instant::now();
+        } else if let Some(retry) = self.retry.take_if(|retry| Instant::now() >= retry.at) {
+            log(format_args!("controller: retrying {} lights", retry.addresses.len()));
+            self.lights.set_all_on(&retry.addresses, self.camera_on);
+            self.next_refresh = Instant::now();
         }
 
-        if self.needs_light_states(settings) && Instant::now() >= self.next_refresh {
-            self.refresh_light_states(settings);
-            self.next_refresh = Instant::now() + REFRESH_INTERVAL;
+        if self.window_open && !self.refreshing && Instant::now() >= self.next_refresh {
+            self.start_refresh();
         }
+    }
 
+    fn publish_status(&self, settings: &Settings) {
         let status = Status {
             camera_supported: self.camera_supported,
             camera_on: self.camera_on,
-            lights: settings
-                .lights
+            cameras: self.cameras.clone(),
+            lights: self
+                .found
                 .iter()
-                .map(|address| LightStatus { address: address.clone(), state: self.light_state(address) })
+                .map(|light| LightStatus {
+                    id: light.id.clone(),
+                    name: light.name.clone(),
+                    address: light.address.clone(),
+                    state: self.light_states.get(&light.id).copied().unwrap_or(LightState::Unknown),
+                    tracked: settings.is_tracked(&light.id),
+                })
                 .collect(),
         };
 
@@ -198,55 +286,25 @@ impl Controller {
         }
     }
 
-    fn refresh_light_states(&mut self, settings: &Settings) {
-        let states = self.lights.are_on(&settings.lights);
+    /// Queries all found lights on a separate thread, the result comes back as `Event::LightsRefreshed`.
+    fn start_refresh(&mut self) {
+        self.refreshing = true;
 
-        // Forced mode: switch back lights that don't match the camera, unless a delay is still running
-        if !settings.allow_manual_override && self.camera_on == self.lights_camera_state {
-            let mismatched: Vec<String> = settings
-                .lights
-                .iter()
-                .zip(&states)
-                .filter(|(_, on)| **on != Some(self.camera_on))
-                .map(|(address, _)| address.clone())
-                .collect();
+        let lights = self.lights.clone();
+        let events = self.shared.events.clone();
+        let (ids, addresses): (Vec<String>, Vec<String>) =
+            self.found.iter().map(|light| (light.id.clone(), light.address.clone())).unzip();
 
-            self.lights.set_all_on(&mismatched, self.camera_on);
+        let spawned = thread::Builder::new().name("light-refresh".into()).spawn(move || {
+            let started = Instant::now();
+            let states = lights.are_on(&addresses);
+            log(format_args!("refresh: {} lights took {}ms", addresses.len(), started.elapsed().as_millis()));
+
+            let _ = events.send(Event::LightsRefreshed(ids.into_iter().zip(states).collect()));
+        });
+
+        if spawned.is_err() {
+            self.refreshing = false;
         }
-
-        self.light_states = settings
-            .lights
-            .iter()
-            .zip(states)
-            .map(|(address, on)| LightStatus {
-                address: address.clone(),
-                state: match on {
-                    Some(true) => LightState::On,
-                    Some(false) => LightState::Off,
-                    None => LightState::Unreachable,
-                },
-            })
-            .collect();
     }
-
-    fn light_state(&self, address: &str) -> LightState {
-        self.light_states
-            .iter()
-            .find(|light| light.address == address)
-            .map_or(LightState::Unknown, |light| light.state)
-    }
-}
-
-fn update_tray(app: &AppHandle, camera_on: bool) {
-    let Some(tray) = app.tray_by_id(TRAY_ID) else {
-        return;
-    };
-
-    let icon = if camera_on { TRAY_ICON_LIT } else { TRAY_ICON_UNLIT };
-    if let Ok(image) = Image::from_bytes(icon) {
-        let _ = tray.set_icon(Some(image));
-    }
-
-    let tooltip = if camera_on { "AutoKeyLight: camera is on" } else { "AutoKeyLight: camera is off" };
-    let _ = tray.set_tooltip(Some(tooltip));
 }

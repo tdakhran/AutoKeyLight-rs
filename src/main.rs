@@ -1,9 +1,11 @@
-// Don't open a console window on Windows in release builds
-#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+// Don't open a console window on Windows
+#![windows_subsystem = "windows"]
 
 mod camera;
 mod controller;
+mod discovery;
 mod lights;
+mod log;
 mod settings;
 
 use std::sync::{mpsc, Arc, Mutex};
@@ -11,7 +13,7 @@ use std::sync::{mpsc, Arc, Mutex};
 use tauri::image::Image;
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
-use tauri::{AppHandle, Manager, State, WindowEvent};
+use tauri::{AppHandle, LogicalSize, Manager, State, WebviewWindow, WindowEvent};
 use tauri_plugin_autostart::{MacosLauncher, ManagerExt};
 
 use controller::{Event, Shared, Status};
@@ -19,6 +21,7 @@ use settings::Settings;
 
 /// Passed when started at login, so the app starts in the tray
 const MINIMIZED_ARG: &str = "--minimized";
+const TRAY_ICON: &[u8] = include_bytes!("../icons/tray.png");
 
 #[tauri::command]
 fn get_settings(shared: State<'_, Arc<Shared>>) -> Settings {
@@ -27,10 +30,11 @@ fn get_settings(shared: State<'_, Arc<Shared>>) -> Settings {
 
 #[tauri::command]
 fn update_settings(shared: State<'_, Arc<Shared>>, settings: Settings) -> Result<Settings, String> {
-    let settings = settings.normalized();
     settings.save(&shared.settings_path).map_err(|error| error.to_string())?;
-    *shared.settings.lock().unwrap() = settings.clone();
-    let _ = shared.events.send(Event::SettingsChanged);
+
+    let previous = std::mem::replace(&mut *shared.settings.lock().unwrap(), settings.clone());
+    let newly_tracked = previous.untracked_lights.into_iter().filter(|id| settings.is_tracked(id)).collect();
+    let _ = shared.events.send(Event::SettingsChanged { newly_tracked });
 
     Ok(settings)
 }
@@ -53,6 +57,16 @@ fn set_autostart(app: AppHandle, enabled: bool) -> Result<(), String> {
     result.map_err(|error| error.to_string())
 }
 
+/// Resizes the window to the height of its content, keeping the width
+#[tauri::command]
+fn fit_window(window: WebviewWindow, height: f64) -> Result<(), String> {
+    let size = window.inner_size().map_err(|error| error.to_string())?;
+    let scale = window.scale_factor().map_err(|error| error.to_string())?;
+    let width = size.to_logical::<f64>(scale).width;
+
+    window.set_size(LogicalSize::new(width, height)).map_err(|error| error.to_string())
+}
+
 fn notify(app: &AppHandle, event: Event) {
     if let Some(shared) = app.try_state::<Arc<Shared>>() {
         let _ = shared.events.send(event);
@@ -73,8 +87,8 @@ fn build_tray(app: &AppHandle) -> tauri::Result<()> {
     let exit = MenuItem::with_id(app, "exit", "Exit", true, None::<&str>)?;
     let menu = Menu::with_items(app, &[&open, &exit])?;
 
-    TrayIconBuilder::with_id(controller::TRAY_ID)
-        .icon(Image::from_bytes(controller::TRAY_ICON_UNLIT)?)
+    TrayIconBuilder::new()
+        .icon(Image::from_bytes(TRAY_ICON)?)
         .tooltip("AutoKeyLight")
         .menu(&menu)
         .show_menu_on_left_click(false)
@@ -98,23 +112,34 @@ fn main() {
         // Must be registered first, starting a second copy shows the running one instead
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| show_main_window(app)))
         .plugin(tauri_plugin_autostart::init(MacosLauncher::LaunchAgent, Some(vec![MINIMIZED_ARG])))
-        .invoke_handler(tauri::generate_handler![get_settings, update_settings, get_status, get_autostart, set_autostart])
+        .invoke_handler(tauri::generate_handler![
+            get_settings,
+            update_settings,
+            get_status,
+            get_autostart,
+            set_autostart,
+            fit_window
+        ])
         .setup(|app| {
             let settings_path = app.path().app_config_dir()?.join("settings.json");
             let (events, events_receiver) = mpsc::channel();
 
             let camera_events = events.clone();
-            let camera_supported = camera::spawn_monitor(move |on| {
-                let _ = camera_events.send(Event::Camera(on));
+            let camera_supported = camera::spawn_monitor(move |cameras| {
+                let _ = camera_events.send(Event::Camera(cameras));
             });
 
             let shared = Arc::new(Shared {
                 settings: Mutex::new(Settings::load(&settings_path)),
                 status: Mutex::new(Status { camera_supported, ..Status::default() }),
                 settings_path,
-                events,
+                events: events.clone(),
             });
             app.manage(shared.clone());
+
+            if let Err(error) = discovery::spawn(events) {
+                log::log(format_args!("discovery unavailable: {error}"));
+            }
 
             build_tray(app.handle())?;
             controller::spawn(app.handle().clone(), shared, camera_supported, events_receiver);

@@ -29,6 +29,11 @@
   box-sizing: border-box;
 }
 
+html,
+body {
+  overflow: hidden;
+}
+
 body {
   margin: 0;
   background: var(--bg);
@@ -96,14 +101,38 @@ h2 {
   padding: 4px 0;
 }
 
-#lights .address {
+#lights .label {
   flex: 1;
-  font-family: ui-monospace, Consolas, monospace;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+#lights .name,
+#lights .address {
   overflow: hidden;
   text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+#lights .address {
+  color: var(--muted);
+  font-family: ui-monospace, Consolas, monospace;
+  font-size: 11px;
 }
 
 #lights .state {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+#lights li.disabled .label,
+#lights li.disabled .state {
+  opacity: 0.5;
+}
+
+.hint {
+  margin: 0 0 6px;
   color: var(--muted);
   font-size: 12px;
 }
@@ -113,12 +142,6 @@ h2 {
   color: var(--muted);
 }
 
-form {
-  display: flex;
-  gap: 6px;
-}
-
-input[type="text"],
 input[type="number"] {
   min-width: 0;
   padding: 5px 8px;
@@ -127,10 +150,6 @@ input[type="number"] {
   background: var(--bg);
   color: var(--text);
   font: inherit;
-}
-
-input[type="text"] {
-  flex: 1;
 }
 
 input[type="number"] {
@@ -157,9 +176,14 @@ button:hover {
   border-color: var(--accent);
 }
 
-button.remove {
+button.small {
   padding: 2px 8px;
   font-size: 12px;
+}
+
+button.primary {
+  border-color: var(--accent);
+  color: var(--accent);
 }
 
 .field {
@@ -184,12 +208,6 @@ button.remove {
 .check input {
   margin: 3px 0 0;
   accent-color: var(--accent);
-}
-
-.check small {
-  display: block;
-  color: var(--muted);
-  font-size: 12px;
 }
 
 .error {
