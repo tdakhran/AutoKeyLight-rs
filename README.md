@@ -9,11 +9,21 @@ which is MIT licensed. Thanks Gabriel!
 
 ## Features
 
-- Runs in the tray, the settings window opens from the tray icon
-- Turns the lights on when any app starts streaming from a camera, and off when it stops
+- Runs in the tray. The tray icon lights up while the camera is on, click it to open the settings window
+- Turns the lights on when any app starts streaming from a camera, and off when it stops. Apps that only open the
+  camera to list it don't count
 - Optional delays before turning the lights on or off
-- **Allow manual override**: only switch the lights when the camera turns on or off, so lights you turn on yourself stay on
-- Start at login
+- Two modes:
+  - **Default**: the lights always follow the camera. If you switch a light yourself, it's switched back within a second
+  - **Allow manual override**: the lights are switched once when the camera turns on or off and otherwise left alone,
+    so lights you switch yourself stay that way
+- The settings window shows whether each light is on, off or unreachable, and stays on top of other windows
+- Quiet on the network: lights are only asked for their state while the settings window is open, or in the default
+  mode where it's needed to keep them in sync. With manual override on and the window closed, the app only talks to
+  the lights when the camera turns on or off
+- Lights that don't respond are retried every second, and an unreachable light doesn't hold up the others
+- Start at login, in the tray
+- Closing the window keeps the app running in the tray, **Exit** in the tray menu quits it
 - Only one copy runs at a time, starting it again opens the running one
 - Imports your lights from Elgato Control Center on first run (Windows)
 
@@ -21,8 +31,10 @@ which is MIT licensed. Thanks Gabriel!
 
 | | Windows | macOS | Linux |
 |---|---|---|---|
-| Tray app and settings | ✅ | ✅ | ✅ |
-| Camera detection | ✅ Media Foundation | Planned (CoreMediaIO) | Planned |
+| Tray app and settings | ✅ | Not tested yet | Not tested yet |
+| Camera detection | ✅ Media Foundation | Not yet, planned with CoreMediaIO | Not yet |
+
+Without camera detection the app runs but never switches the lights, the settings window says so.
 
 On Windows, camera usage is detected with the Media Foundation
 [sensor activity monitor](https://learn.microsoft.com/en-us/windows/win32/api/mfidl/nn-mfidl-imfsensoractivitymonitor).

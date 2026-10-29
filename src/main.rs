@@ -53,7 +53,7 @@ fn set_autostart(app: AppHandle, enabled: bool) -> Result<(), String> {
 }
 
 fn show_main_window(app: &AppHandle) {
-    if let Some(window) = app.get_webview_window("main") {
+    if let Some(window) = app.get_webview_window(controller::MAIN_WINDOW) {
         let _ = window.unminimize();
         let _ = window.show();
         let _ = window.set_focus();

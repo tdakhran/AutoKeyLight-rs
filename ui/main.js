@@ -21,11 +21,16 @@ async function saveSettings(changes) {
   renderSettings();
 }
 
+const LIGHT_STATES = {
+  on: { text: "on", className: "on" },
+  off: { text: "off", className: "off" },
+  unreachable: { text: "unreachable", className: "" },
+  unknown: { text: "checking…", className: "" },
+};
+
 function lightState(address) {
   const light = status?.lights.find((light) => light.address === address);
-  if (!light) return { text: "", className: "" };
-  if (light.on === null) return { text: "unreachable", className: "" };
-  return light.on ? { text: "on", className: "on" } : { text: "off", className: "off" };
+  return LIGHT_STATES[light?.state ?? "unknown"];
 }
 
 function renderLights() {

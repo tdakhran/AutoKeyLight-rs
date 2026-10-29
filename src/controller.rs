@@ -8,23 +8,33 @@ use std::time::{Duration, Instant};
 
 use serde::Serialize;
 use tauri::image::Image;
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle, Emitter, Manager};
 
 use crate::lights::Lights;
 use crate::settings::Settings;
 
+pub const MAIN_WINDOW: &str = "main";
 pub const TRAY_ID: &str = "main";
 pub const TRAY_ICON_LIT: &[u8] = include_bytes!("../icons/tray-lit.png");
 pub const TRAY_ICON_UNLIT: &[u8] = include_bytes!("../icons/tray-unlit.png");
 
 const TICK: Duration = Duration::from_secs(1);
 
-#[derive(Clone, Default, Serialize)]
+#[derive(Clone, Copy, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum LightState {
+    /// Not checked, lights are only queried while they're needed
+    Unknown,
+    On,
+    Off,
+    Unreachable,
+}
+
+#[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LightStatus {
     pub address: String,
-    /// `None` if the light couldn't be reached
-    pub on: Option<bool>,
+    pub state: LightState,
 }
 
 #[derive(Clone, Default, Serialize)]
@@ -65,7 +75,9 @@ fn run(app: AppHandle, shared: Arc<Shared>, camera: Option<Arc<AtomicBool>>) {
             update_tray(&app, is_camera_on);
         }
 
-        let light_states = lights.are_on(&settings.lights);
+        // Light states are only needed to show them in the window, and for forced mode to find the lights that don't match
+        let light_states = (is_window_open(&app) || !settings.allow_manual_override)
+            .then(|| lights.are_on(&settings.lights));
 
         let delay_ms = if is_camera_on { settings.camera_on_delay_ms } else { settings.camera_off_delay_ms };
 
@@ -75,12 +87,12 @@ fn run(app: AppHandle, shared: Arc<Shared>, camera: Option<Arc<AtomicBool>>) {
                 if is_camera_on != lights_camera_state && lights.set_all_on(&settings.lights, is_camera_on) {
                     lights_camera_state = is_camera_on;
                 }
-            } else {
+            } else if let Some(light_states) = &light_states {
                 // Force the lights to follow the camera, only sending requests to the ones that don't match
                 let mismatched: Vec<String> = settings
                     .lights
                     .iter()
-                    .zip(&light_states)
+                    .zip(light_states)
                     .filter(|(_, on)| **on != Some(is_camera_on))
                     .map(|(address, _)| address.clone())
                     .collect();
@@ -90,14 +102,26 @@ fn run(app: AppHandle, shared: Arc<Shared>, camera: Option<Arc<AtomicBool>>) {
             }
         }
 
+        let states: Vec<LightState> = match light_states {
+            Some(light_states) => light_states
+                .into_iter()
+                .map(|on| match on {
+                    Some(true) => LightState::On,
+                    Some(false) => LightState::Off,
+                    None => LightState::Unreachable,
+                })
+                .collect(),
+            None => vec![LightState::Unknown; settings.lights.len()],
+        };
+
         let status = Status {
             camera_supported: camera.is_some(),
             camera_on: is_camera_on,
             lights: settings
                 .lights
                 .iter()
-                .zip(light_states)
-                .map(|(address, on)| LightStatus { address: address.clone(), on })
+                .zip(states)
+                .map(|(address, state)| LightStatus { address: address.clone(), state })
                 .collect(),
         };
 
@@ -106,6 +130,12 @@ fn run(app: AppHandle, shared: Arc<Shared>, camera: Option<Arc<AtomicBool>>) {
 
         thread::sleep(TICK);
     }
+}
+
+fn is_window_open(app: &AppHandle) -> bool {
+    app.get_webview_window(MAIN_WINDOW).is_some_and(|window| {
+        window.is_visible().unwrap_or(false) && !window.is_minimized().unwrap_or(false)
+    })
 }
 
 fn update_tray(app: &AppHandle, camera_on: bool) {
