@@ -135,12 +135,17 @@ fn build_tray(app: &AppHandle) -> tauri::Result<()> {
         Some(AboutMetadata {
             name: Some("AutoKeyLight".into()),
             version: Some(VERSION.into()),
+            // macOS adds the bundle version in parentheses unless there's a separate one, an empty one hides it.
+            // Elsewhere it's appended to the version as is
+            short_version: cfg!(target_os = "macos").then(String::new),
             authors: Some(authors()),
             comments: Some(env!("CARGO_PKG_DESCRIPTION").into()),
             copyright: Some(COPYRIGHT.into()),
             license: Some(env!("CARGO_PKG_LICENSE").into()),
             website: Some(REPOSITORY.into()),
             website_label: Some("GitHub".into()),
+            // macOS shows credits instead of the website, as plain text
+            credits: Some(REPOSITORY.into()),
             icon: Image::from_bytes(TRAY_ICON).ok(),
             ..Default::default()
         }),
