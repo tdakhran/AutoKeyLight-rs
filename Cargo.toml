@@ -1,6 +1,6 @@
 [package]
 name = "autokeylight"
-version = "0.1.0"
+version = "0.1.1"
 description = "Turns your Elgato lights on and off with your webcam"
 authors = ["Tarek Dakhran <t.dakhran@gmail.com>"]
 license = "MIT"
