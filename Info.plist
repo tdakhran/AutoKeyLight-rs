@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Merged into the macOS app bundle's Info.plist by `cargo tauri build` -->
+<plist version="1.0">
+<dict>
+  <!-- Shown when macOS asks for Local Network access -->
+  <key>NSLocalNetworkUsageDescription</key>
+  <string>AutoKeyLight finds your Elgato lights on the local network and turns them on and off with your camera.</string>
+  <!-- Elgato lights announce themselves over mDNS as this service -->
+  <key>NSBonjourServices</key>
+  <array>
+    <string>_elg._tcp</string>
+  </array>
+  <!-- Lives in the menu bar, no Dock icon -->
+  <key>LSUIElement</key>
+  <true/>
+</dict>
+</plist>

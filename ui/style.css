@@ -232,3 +232,17 @@ button.primary {
   margin: 0;
   color: var(--off);
 }
+
+footer {
+  text-align: center;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+footer a {
+  color: inherit;
+}
+
+footer a:hover {
+  color: var(--accent);
+}

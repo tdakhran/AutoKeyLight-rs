@@ -139,11 +139,15 @@ const content = document.querySelector("main");
 
 // Gives up after a few tries without the content changing, rather than resizing forever if it never settles
 const MAX_FIT_ATTEMPTS = 3;
+// Measuring while a resize is still being applied gives a stale height, so wait until resizing settles
+const FIT_DELAY_MS = 100;
 let fitAttempts = 0;
+let fitTimer = null;
 
 function fitWindow() {
   const difference = Math.ceil(content.getBoundingClientRect().height) - window.innerHeight;
-  if (difference === 0) {
+  // Sizes are rounded at display scales like 125%, a pixel off is close enough
+  if (Math.abs(difference) <= 1) {
     fitAttempts = 0;
     return;
   }
@@ -153,18 +157,32 @@ function fitWindow() {
   invoke("fit_window", { difference }).catch(() => {});
 }
 
+function scheduleFit() {
+  clearTimeout(fitTimer);
+  fitTimer = setTimeout(fitWindow, FIT_DELAY_MS);
+}
+
 new ResizeObserver(() => {
   fitAttempts = 0;
-  fitWindow();
+  scheduleFit();
 }).observe(content);
-window.addEventListener("resize", fitWindow);
+window.addEventListener("resize", scheduleFit);
 
 listen("status", (event) => {
   status = event.payload;
   renderStatus();
 });
 
+$("repository").addEventListener("click", (event) => {
+  event.preventDefault();
+  invoke("open_repository").catch(showError);
+});
+
 (async () => {
+  const about = await invoke("get_about");
+  $("version").textContent = `v${about.version}`;
+  $("repository").title = about.repository;
+
   settings = await invoke("get_settings");
   status = await invoke("get_status");
   $("autostart").checked = await invoke("get_autostart");

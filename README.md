@@ -28,6 +28,23 @@ which is MIT licensed. Thanks Gabriel!
 - Only one copy runs at a time, starting it again opens the running one
 - Finds your lights on the network automatically with mDNS, no IP addresses to enter. Lights that leave the network
   drop off the list, and tracking survives IP changes
+- **About** in the tray menu shows the version, author and a link to GitHub, the window shows the version and a link to
+  GitHub at the bottom
+
+## Installing
+
+Download the installer for your system from the [releases](https://github.com/tdakhran/AutoKeyLight-rs/releases).
+
+**Windows:** run `AutoKeyLight_<version>_x64-setup.exe`. It installs for your user only, no administrator rights
+needed, into `%LOCALAPPDATA%\AutoKeyLight`, and adds a Start menu shortcut. To uninstall, use **Settings** → **Apps**,
+which also removes the start at login entry. Tick **Delete the application data** in the uninstaller to remove your
+settings too.
+
+**macOS:** open `AutoKeyLight_<version>_aarch64.dmg` and drag AutoKeyLight into Applications. The app lives in the menu
+bar, without a Dock icon. Builds aren't signed with an Apple Developer certificate, so the first time, right click the
+app and choose **Open**, or allow it under **System Settings** → **Privacy & Security**. To uninstall, turn off start
+at login in the app first, then drag it from Applications to the Trash. Settings are kept in
+`~/Library/Application Support/com.tdakhran.autokeylight`. Only Apple silicon Macs are supported for now.
 
 ## Platform support
 
@@ -91,11 +108,32 @@ cargo build --release
 
 The binary ends up in `target/release/`.
 
-To build installers (`.msi`/`.exe`, `.dmg`, `.deb`/AppImage), install the Tauri CLI and run it on the target platform:
+To build the installers, install the Tauri CLI and run it on the target platform. Windows builds a setup `.exe`
+(NSIS), macOS builds `AutoKeyLight.app` and a `.dmg`:
 
 ```sh
 cargo install tauri-cli --version "^2"
 cargo tauri build
+```
+
+The installers end up in `target/release/bundle/`. Their name, publisher, description and icons are set under
+`bundle` in `tauri.conf.json`, `Info.plist` adds the macOS specific keys and `windows/installer-hooks.nsh` cleans up
+the start at login entry when uninstalling on Windows.
+
+### Version and author
+
+The version, author and GitHub link shown in the app and the installers all come from `Cargo.toml`. To release a new
+version, bump `version` there.
+
+### Releases
+
+[GitHub Actions](.github/workflows/build.yml) builds the Windows installer and the macOS disk image on every push and
+pull request, they're attached to each run. Pushing a tag that matches the version, for example `v0.2.0`, also
+creates a draft release with both installers, publish it on GitHub when it looks right:
+
+```sh
+git tag v0.2.0
+git push origin v0.2.0
 ```
 
 ### Building natively on Windows
@@ -122,7 +160,8 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 cargo build --release
 ```
 
-`cargo tauri build` creates `AutoKeyLight.app` and a `.dmg`.
+`cargo tauri build` creates `AutoKeyLight.app` and a `.dmg`. Set `CI=true` when building over SSH, styling the disk
+image window goes through Finder, which needs a logged in desktop.
 
 To try a build over SSH, a user has to be logged in to the desktop, and the app has to be started inside that session
 with `open`, which needs an app bundle. A minimal one is enough: the binary in `AutoKeyLight.app/Contents/MacOS/`
@@ -157,6 +196,9 @@ src/
     media_foundation.rs         Windows camera detection
     core_media_io.rs            macOS camera detection
 ui/                             settings window (plain HTML, CSS and JS, no build step)
+windows/installer-hooks.nsh     Windows uninstaller cleanup
+Info.plist                      macOS bundle keys, merged into the app's Info.plist
+.github/workflows/build.yml     builds the installers and draft releases
 ```
 
 ## License

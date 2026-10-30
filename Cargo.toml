@@ -4,6 +4,7 @@ version = "0.1.0"
 description = "Turns your Elgato lights on and off with your webcam"
 authors = ["Tarek Dakhran <t.dakhran@gmail.com>"]
 license = "MIT"
+repository = "https://github.com/tdakhran/AutoKeyLight-rs"
 edition = "2021"
 
 [build-dependencies]
@@ -18,6 +19,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 ureq = { version = "3", features = ["json"] }
 mdns-sd = "0.21.6"
+tauri-plugin-opener = "2"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 block2 = "0.6"

@@ -11,10 +11,12 @@ mod settings;
 use std::sync::{mpsc, Arc, Mutex};
 
 use tauri::image::Image;
-use tauri::menu::{Menu, MenuItem};
+use serde::Serialize;
+use tauri::menu::{AboutMetadata, Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, LogicalSize, Manager, State, WebviewWindow, WindowEvent};
 use tauri_plugin_autostart::{MacosLauncher, ManagerExt};
+use tauri_plugin_opener::OpenerExt;
 
 use controller::{Event, Shared, Status};
 use settings::Settings;
@@ -22,6 +24,35 @@ use settings::Settings;
 /// Passed when started at login, so the app starts in the tray
 const MINIMIZED_ARG: &str = "--minimized";
 const TRAY_ICON: &[u8] = include_bytes!("../icons/tray.png");
+// Version, author and repository all come from Cargo.toml
+const VERSION: &str = env!("CARGO_PKG_VERSION");
+const REPOSITORY: &str = env!("CARGO_PKG_REPOSITORY");
+const COPYRIGHT: &str = "© 2026 Tarek Dakhran";
+
+/// Author names without email addresses
+fn authors() -> Vec<String> {
+    env!("CARGO_PKG_AUTHORS")
+        .split(':')
+        .map(|author| author.split('<').next().unwrap_or(author).trim().to_string())
+        .collect()
+}
+
+#[derive(Serialize)]
+struct About {
+    version: &'static str,
+    repository: &'static str,
+}
+
+#[tauri::command]
+fn get_about() -> About {
+    About { version: VERSION, repository: REPOSITORY }
+}
+
+#[tauri::command]
+fn open_repository(app: AppHandle) -> Result<(), String> {
+    app.opener().open_url(REPOSITORY, None::<&str>).map_err(|error| error.to_string())
+}
+
 /// Matches the width in tauri.conf.json, the window only ever changes height
 const WINDOW_WIDTH: f64 = 360.0;
 
@@ -67,6 +98,7 @@ fn fit_window(window: WebviewWindow, difference: f64) -> Result<(), String> {
     let scale = window.scale_factor().map_err(|error| error.to_string())?;
     let height = window.inner_size().map_err(|error| error.to_string())?.to_logical::<f64>(scale).height;
     let size = LogicalSize::new(WINDOW_WIDTH, height + difference);
+    log::log(format_args!("fit_window: inner height {height}, difference {difference}, scale {scale}"));
 
     // macOS ignores resizing a window that isn't resizable, so allow it just for this. Not on Windows, where it
     // changes the frame thickness and with it the size
@@ -97,8 +129,24 @@ fn show_main_window(app: &AppHandle) {
 
 fn build_tray(app: &AppHandle) -> tauri::Result<()> {
     let open = MenuItem::with_id(app, "open", "Open", true, None::<&str>)?;
+    let about = PredefinedMenuItem::about(
+        app,
+        Some("About"),
+        Some(AboutMetadata {
+            name: Some("AutoKeyLight".into()),
+            version: Some(VERSION.into()),
+            authors: Some(authors()),
+            comments: Some(env!("CARGO_PKG_DESCRIPTION").into()),
+            copyright: Some(COPYRIGHT.into()),
+            license: Some(env!("CARGO_PKG_LICENSE").into()),
+            website: Some(REPOSITORY.into()),
+            website_label: Some("GitHub".into()),
+            icon: Image::from_bytes(TRAY_ICON).ok(),
+            ..Default::default()
+        }),
+    )?;
     let exit = MenuItem::with_id(app, "exit", "Exit", true, None::<&str>)?;
-    let menu = Menu::with_items(app, &[&open, &exit])?;
+    let menu = Menu::with_items(app, &[&open, &about, &PredefinedMenuItem::separator(app)?, &exit])?;
 
     TrayIconBuilder::new()
         .icon(Image::from_bytes(TRAY_ICON)?)
@@ -125,13 +173,16 @@ fn main() {
         // Must be registered first, starting a second copy shows the running one instead
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| show_main_window(app)))
         .plugin(tauri_plugin_autostart::init(MacosLauncher::LaunchAgent, Some(vec![MINIMIZED_ARG])))
+        .plugin(tauri_plugin_opener::init())
         .invoke_handler(tauri::generate_handler![
             get_settings,
             update_settings,
             get_status,
             get_autostart,
             set_autostart,
-            fit_window
+            fit_window,
+            get_about,
+            open_repository
         ])
         .setup(|app| {
             let settings_path = app.path().app_config_dir()?.join("settings.json");
