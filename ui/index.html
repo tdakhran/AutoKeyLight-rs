@@ -9,38 +9,100 @@
   </head>
   <body>
     <main>
-      <section class="status">
-        <div class="status-row">
-          <span class="dot" id="camera-dot"></span>
-          <span id="camera-state">Checking camera…</span>
-        </div>
-      </section>
+      <nav class="tabs">
+        <button class="tab" data-tab="lights-tab">Lights</button>
+        <button class="tab" data-tab="camera-tab">Camera</button>
+        <button class="tab" data-tab="calendar-tab">Calendar</button>
+      </nav>
 
-      <section>
-        <h2>Lights</h2>
-        <p class="hint">Tracked lights turn on and off with the camera.</p>
-        <ul id="lights"></ul>
-        <p class="empty" id="no-lights" hidden>Looking for lights on your network…</p>
-      </section>
+      <div class="tab-panel" id="lights-tab">
+        <section>
+          <h2>Lights</h2>
+          <p class="hint">Tracked lights follow the camera and blink for meetings.</p>
+          <ul id="lights"></ul>
+          <p class="empty" id="no-lights" hidden>Looking for lights on your network…</p>
+        </section>
 
-      <section>
-        <h2>Delays</h2>
-        <label class="field">
-          <span>Before turning on</span>
-          <span class="number"><input id="on-delay" type="number" min="0" step="100" /> ms</span>
-        </label>
-        <label class="field">
-          <span>Before turning off</span>
-          <span class="number"><input id="off-delay" type="number" min="0" step="100" /> ms</span>
-        </label>
-      </section>
+        <section>
+          <label class="check">
+            <input id="autostart" type="checkbox" />
+            <span>Start at login</span>
+          </label>
+        </section>
+      </div>
 
-      <section>
-        <label class="check">
-          <input id="autostart" type="checkbox" />
-          <span>Start at login</span>
-        </label>
-      </section>
+      <div class="tab-panel" id="camera-tab" hidden>
+        <section class="status">
+          <div class="status-row">
+            <span class="dot" id="camera-dot"></span>
+            <span class="status-text" id="camera-state">Checking camera…</span>
+            <label class="switch" title="Turn tracked lights on and off with the camera">
+              <input id="camera-enabled" type="checkbox" />
+              <span class="slider"></span>
+            </label>
+          </div>
+        </section>
+
+        <section>
+          <h2>Delays</h2>
+          <label class="field">
+            <span>Before turning on</span>
+            <span class="number"><input id="on-delay" type="number" min="0" step="100" /> ms</span>
+          </label>
+          <label class="field">
+            <span>Before turning off</span>
+            <span class="number"><input id="off-delay" type="number" min="0" step="100" /> ms</span>
+          </label>
+        </section>
+      </div>
+
+      <div class="tab-panel" id="calendar-tab" hidden>
+        <section class="status">
+          <div class="status-row">
+            <span class="dot" id="calendar-dot"></span>
+            <span class="status-text" id="calendar-state">No calendar yet</span>
+            <label class="switch" title="Blink tracked lights when a meeting starts">
+              <input id="calendar-enabled" type="checkbox" />
+              <span class="slider"></span>
+            </label>
+          </div>
+        </section>
+
+        <section>
+          <h2>Calendar link</h2>
+          <p class="hint">
+            Your calendar's private iCal link, ending in .ics. Google Calendar: Settings → your calendar → Integrate
+            calendar → Secret address in iCal format. Outlook: Settings → Calendar → Shared calendars → Publish a
+            calendar.
+          </p>
+          <form id="calendar-form">
+            <input id="calendar-url" type="password" placeholder="https://…/basic.ics" spellcheck="false" autocomplete="off" />
+            <button type="button" class="small" id="calendar-show">Show</button>
+            <button type="submit" class="small">Save</button>
+            <button type="button" class="small" id="calendar-remove" hidden>Remove</button>
+          </form>
+          <label class="field">
+            <span>Check for changes every</span>
+            <span class="number"><input id="calendar-refresh" type="number" min="1" max="120" step="1" /> min</span>
+          </label>
+        </section>
+
+        <section>
+          <h2>Meeting reminder</h2>
+          <p class="hint">When a meeting starts, tracked lights blink, then go back the way they were.</p>
+          <label class="field">
+            <span>Blinks</span>
+            <span class="number"><input id="flash-count" type="number" min="1" max="10" step="1" /> times</span>
+          </label>
+          <label class="field">
+            <span>Interval</span>
+            <span class="number"><input id="flash-interval" type="number" min="100" max="5000" step="100" /> ms</span>
+          </label>
+          <div class="actions">
+            <button id="flash-test">Test</button>
+          </div>
+        </section>
+      </div>
 
       <p class="error" id="error" hidden></p>
 

@@ -11,9 +11,13 @@ by [Gabriel Garcia (@astutejoe)](https://github.com/astutejoe), the original Win
 
 - Lives in the tray (menu bar on macOS), click the icon for settings
 - Finds your lights on the network automatically, no IP addresses to enter
-- Lights switch only when the camera turns on or off, so lights you switch yourself stay that way
-- **Track** or **Untrack** each light, optional delays before turning lights on or off, start at login
-- Event driven, does nothing in the background until the camera changes
+- **Camera:** lights switch only when the camera turns on or off, so lights you switch yourself stay that way.
+  Optional delays before turning them on or off
+- **Calendar:** lights blink when a meeting starts, then go back the way they were. Uses your calendar's private iCal
+  link, for example Google Calendar's *Secret address in iCal format*. No blinking while the computer is locked
+- Turn the camera or calendar trigger on and off separately, **Track** or **Untrack** each light, start at login
+- Event driven, nothing runs in the background until the camera changes or a meeting starts, apart from checking the
+  calendar for changes (every 15 minutes by default)
 
 ## Install
 

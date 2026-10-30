@@ -1,10 +1,12 @@
 // Don't open a console window on Windows
 #![windows_subsystem = "windows"]
 
+mod calendar;
 mod camera;
 mod controller;
 mod discovery;
 mod lights;
+mod lock;
 mod log;
 mod settings;
 
@@ -14,7 +16,7 @@ use tauri::image::Image;
 use serde::Serialize;
 use tauri::menu::{AboutMetadata, Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
-use tauri::{AppHandle, LogicalSize, Manager, State, WebviewWindow, WindowEvent};
+use tauri::{AppHandle, Manager, State, WindowEvent};
 use tauri_plugin_autostart::{MacosLauncher, ManagerExt};
 use tauri_plugin_opener::OpenerExt;
 
@@ -53,9 +55,6 @@ fn open_repository(app: AppHandle) -> Result<(), String> {
     app.opener().open_url(REPOSITORY, None::<&str>).map_err(|error| error.to_string())
 }
 
-/// Matches the width in tauri.conf.json, the window only ever changes height
-const WINDOW_WIDTH: f64 = 360.0;
-
 #[tauri::command]
 fn get_settings(shared: State<'_, Arc<Shared>>) -> Settings {
     shared.settings.lock().unwrap().clone()
@@ -63,6 +62,7 @@ fn get_settings(shared: State<'_, Arc<Shared>>) -> Settings {
 
 #[tauri::command]
 fn update_settings(shared: State<'_, Arc<Shared>>, settings: Settings) -> Result<Settings, String> {
+    let settings = settings.clamped();
     settings.save(&shared.settings_path).map_err(|error| error.to_string())?;
 
     let previous = std::mem::replace(&mut *shared.settings.lock().unwrap(), settings.clone());
@@ -70,6 +70,12 @@ fn update_settings(shared: State<'_, Arc<Shared>>, settings: Settings) -> Result
     let _ = shared.events.send(Event::SettingsChanged { newly_tracked });
 
     Ok(settings)
+}
+
+/// Blinks the tracked lights now, to try the meeting reminder
+#[tauri::command]
+fn flash_lights(shared: State<'_, Arc<Shared>>) {
+    let _ = shared.events.send(Event::FlashNow);
 }
 
 #[tauri::command]
@@ -88,28 +94,6 @@ fn set_autostart(app: AppHandle, enabled: bool) -> Result<(), String> {
     let result = if enabled { autolaunch.enable() } else { autolaunch.disable() };
 
     result.map_err(|error| error.to_string())
-}
-
-/// Grows or shrinks the window by `difference`, the content height minus the height the page actually has.
-/// Measured by the page, because what the window size covers differs between platforms, on macOS it includes
-/// the title bar.
-#[tauri::command]
-fn fit_window(window: WebviewWindow, difference: f64) -> Result<(), String> {
-    let scale = window.scale_factor().map_err(|error| error.to_string())?;
-    let height = window.inner_size().map_err(|error| error.to_string())?.to_logical::<f64>(scale).height;
-    let size = LogicalSize::new(WINDOW_WIDTH, height + difference);
-    log::log(format_args!("fit_window: inner height {height}, difference {difference}, scale {scale}"));
-
-    // macOS ignores resizing a window that isn't resizable, so allow it just for this. Not on Windows, where it
-    // changes the frame thickness and with it the size
-    if cfg!(target_os = "macos") {
-        let _ = window.set_resizable(true);
-        let result = window.set_size(size);
-        let _ = window.set_resizable(false);
-        result.map_err(|error| error.to_string())
-    } else {
-        window.set_size(size).map_err(|error| error.to_string())
-    }
 }
 
 fn notify(app: &AppHandle, event: Event) {
@@ -185,9 +169,9 @@ fn main() {
             get_status,
             get_autostart,
             set_autostart,
-            fit_window,
             get_about,
-            open_repository
+            open_repository,
+            flash_lights
         ])
         .setup(|app| {
             let settings_path = app.path().app_config_dir()?.join("settings.json");

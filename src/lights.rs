@@ -1,5 +1,6 @@
 //! Talks to Elgato lights over their local HTTP API.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -81,6 +82,45 @@ impl Lights {
 
             handles.into_iter().map(|handle| handle.join().ok().flatten()).collect()
         })
+    }
+
+    /// Switches each light to its own state, in parallel.
+    fn set_each(&self, targets: &[(String, bool)]) {
+        thread::scope(|scope| {
+            for (address, on) in targets {
+                scope.spawn(move || self.set_on(address, *on));
+            }
+        });
+    }
+
+    /// Blinks the lights `count` times, `interval` apart, then leaves each light the way it was.
+    /// Stops right away, without restoring, once `cancel` is set, for example when the camera turns on meanwhile.
+    pub fn flash(&self, addresses: &[String], count: u32, interval: Duration, cancel: &AtomicBool) {
+        // Lights that can't be reached are left out, there's no state to restore for them
+        let original: Vec<(String, bool)> = addresses
+            .iter()
+            .zip(self.are_on(addresses))
+            .filter_map(|(address, on)| Some((address.clone(), on?)))
+            .collect();
+        let toggled: Vec<(String, bool)> = original.iter().map(|(address, on)| (address.clone(), !on)).collect();
+
+        log(format_args!("lights: flashing {} lights {count} times", original.len()));
+
+        for _ in 0..count {
+            for targets in [&toggled, &original] {
+                if cancel.load(Ordering::Relaxed) {
+                    log("lights: flashing cancelled");
+                    return;
+                }
+                self.set_each(targets);
+                thread::sleep(interval);
+            }
+        }
+
+        // Again, in case a light missed one of the changes
+        if !cancel.load(Ordering::Relaxed) {
+            self.set_each(&original);
+        }
     }
 
     /// Switches all lights in parallel, returns the ones that didn't accept the change.
