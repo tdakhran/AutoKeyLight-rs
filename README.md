@@ -21,8 +21,9 @@ Download the installer from the [releases](https://github.com/tdakhran/AutoKeyLi
 
 - **Windows:** run `AutoKeyLight_<version>_x64-setup.exe`, no administrator rights needed. Allow it on private
   networks when Windows Firewall asks. Uninstall from **Settings** → **Apps**.
-- **macOS (Apple silicon):** open the `.dmg` and drag AutoKeyLight into Applications. The app isn't signed, so open it
-  the first time with right click → **Open**, and click **Allow** when it asks to find devices on your local network.
+- **macOS (Apple silicon):** open the `.dmg` and drag AutoKeyLight into Applications. The app isn't signed, so macOS
+  blocks it the first time: open it once, then click **Open Anyway** under **System Settings** → **Privacy & Security**.
+  Click **Allow** when it asks to find devices on your local network.
   Uninstall by turning off start at login, then moving the app to the Trash.
 
 If no lights show up, check the firewall (Windows) or **System Settings** → **Privacy & Security** → **Local Network**
