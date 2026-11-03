@@ -175,7 +175,7 @@ pub fn streaming_cameras() -> Vec<String> {
 
 type OnChange = Box<dyn Fn(Vec<String>) + Send + Sync>;
 
-struct Monitor {
+struct Listeners {
     on_change: OnChange,
     /// Serial queue the listeners run on, so checks never overlap
     queue: usize,
@@ -184,9 +184,9 @@ struct Monitor {
     watched: Mutex<Vec<ObjectId>>,
 }
 
-static MONITOR: OnceLock<Monitor> = OnceLock::new();
+static MONITOR: OnceLock<Listeners> = OnceLock::new();
 
-impl Monitor {
+impl Listeners {
     fn listen(&self, object: ObjectId, selector: u32) -> OsStatus {
         // CoreMediaIO keeps its own reference to the block
         let listener = RcBlock::new(|_address_count: u32, _addresses: *const c_void| {
@@ -230,7 +230,7 @@ pub fn start_monitor(on_change: OnChange) -> Option<Monitor> {
         return None;
     }
 
-    let monitor = Monitor {
+    let monitor = Listeners {
         on_change,
         queue: queue as usize,
         streaming_cameras: Mutex::new(Vec::new()),
