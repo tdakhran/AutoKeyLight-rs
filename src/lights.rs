@@ -10,6 +10,9 @@ use serde_json::json;
 use crate::log::log;
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
+/// Lights answer with a few hundred bytes, ureq's default buffers are 128 KB each way
+const INPUT_BUFFER_BYTES: usize = 16 * 1024;
+const OUTPUT_BUFFER_BYTES: usize = 4 * 1024;
 
 #[derive(Deserialize)]
 struct LightsResponse {
@@ -34,7 +37,7 @@ pub struct Reading {
 /// A light to switch, `brightness` in percent is only sent when turning it on, `None` leaves it as it is
 pub type Target = (String, Option<u8>);
 
-/// Cheap to clone, clones share the connection pool
+/// Cheap to clone, clones share the agent
 #[derive(Clone)]
 pub struct Lights {
     agent: ureq::Agent,
@@ -44,6 +47,11 @@ impl Lights {
     pub fn new() -> Self {
         let agent = ureq::Agent::config_builder()
             .timeout_global(Some(REQUEST_TIMEOUT))
+            .input_buffer_size(INPUT_BUFFER_BYTES)
+            .output_buffer_size(OUTPUT_BUFFER_BYTES)
+            // Idle connections are only dropped on the next request, which can be hours away in the tray. Connecting
+            // to a light on the local network is quick
+            .max_idle_connections(0)
             .build()
             .into();
 
@@ -95,23 +103,12 @@ impl Lights {
 
     /// Queries all lights in parallel, so an unreachable light doesn't hold up the others.
     pub fn read_all(&self, addresses: &[String]) -> Vec<Option<Reading>> {
-        thread::scope(|scope| {
-            let handles: Vec<_> = addresses
-                .iter()
-                .map(|address| scope.spawn(move || self.read(address)))
-                .collect();
-
-            handles.into_iter().map(|handle| handle.join().ok().flatten()).collect()
-        })
+        parallel(addresses, |address| self.read(address))
     }
 
     /// Switches each light to its own state, in parallel.
     fn set_each(&self, targets: &[(String, bool)]) {
-        thread::scope(|scope| {
-            for (address, on) in targets {
-                scope.spawn(move || self.set_on(address, *on, None));
-            }
-        });
+        parallel(targets, |(address, on)| self.set_on(address, *on, None));
     }
 
     /// Blinks the lights `count` times, `interval` apart, then leaves each light the way it was.
@@ -146,16 +143,25 @@ impl Lights {
 
     /// Switches all lights in parallel, returns the ones that didn't accept the change.
     pub fn set_all_on(&self, targets: &[Target], on: bool) -> Vec<Target> {
-        thread::scope(|scope| {
-            let handles: Vec<_> = targets
-                .iter()
-                .map(|target| (target, scope.spawn(move || self.set_on(&target.0, on, target.1))))
-                .collect();
+        let accepted = parallel(targets, |(address, brightness)| self.set_on(address, on, *brightness));
 
-            handles
-                .into_iter()
-                .filter_map(|(target, handle)| (!handle.join().unwrap_or(false)).then(|| target.clone()))
-                .collect()
-        })
+        targets.iter().zip(accepted).filter(|(_, accepted)| !accepted).map(|(target, _)| target.clone()).collect()
     }
+}
+
+/// Runs `task` on every item at the same time and returns the results in order. The first item runs on the calling
+/// thread, so a single light needs no extra thread. A task that panicked counts as the default result.
+fn parallel<T: Sync, R: Send + Default>(items: &[T], task: impl Fn(&T) -> R + Sync) -> Vec<R> {
+    let Some((first, rest)) = items.split_first() else {
+        return Vec::new();
+    };
+
+    thread::scope(|scope| {
+        let task = &task;
+        let others: Vec<_> = rest.iter().map(|item| scope.spawn(move || task(item))).collect();
+
+        let mut results = vec![task(first)];
+        results.extend(others.into_iter().map(|handle| handle.join().unwrap_or_default()));
+        results
+    })
 }

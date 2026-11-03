@@ -8,9 +8,11 @@ mod discovery;
 mod lights;
 mod lock;
 mod log;
+mod memory;
 mod settings;
 
 use std::sync::{mpsc, Arc, Mutex};
+use std::time::Duration;
 
 use tauri::image::Image;
 use serde::Serialize;
@@ -75,7 +77,14 @@ fn update_settings(shared: State<'_, Arc<Shared>>, settings: Settings) -> Result
 /// Names of the connected cameras, for choosing which ones count
 #[tauri::command]
 async fn list_cameras() -> Vec<String> {
-    camera::connected_cameras()
+    // Enumerating can take a moment, the runtime's only worker serves the window meanwhile
+    tauri::async_runtime::spawn_blocking(camera::connected_cameras).await.unwrap_or_default()
+}
+
+/// Loads the calendar now rather than at the next check
+#[tauri::command]
+fn check_calendar(shared: State<'_, Arc<Shared>>) {
+    let _ = shared.events.send(Event::CheckCalendar);
 }
 
 /// Blinks the tracked lights now, to try the meeting reminder
@@ -216,7 +225,22 @@ fn build_tray(app: &AppHandle) -> tauri::Result<()> {
     Ok(())
 }
 
+/// Tauri's runtime serves the window and runs async commands, the default starts a worker thread per CPU core. One is
+/// plenty, and blocking work gets a thread that exits soon after.
+fn async_runtime() -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .thread_keep_alive(Duration::from_secs(5))
+        .enable_all()
+        .build()
+        .expect("failed to start the async runtime")
+}
+
 fn main() {
+    // Must outlive the app
+    let runtime = async_runtime();
+    tauri::async_runtime::set(runtime.handle().clone());
+
     tauri::Builder::default()
         // Must be registered first, starting a second copy shows the running one instead
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| show_main_window(app)))
@@ -231,27 +255,23 @@ fn main() {
             get_about,
             open_repository,
             flash_lights,
-            list_cameras
+            list_cameras,
+            check_calendar
         ])
         .setup(|app| {
             let settings_path = app.path().app_config_dir()?.join("settings.json");
             let (events, events_receiver) = mpsc::channel();
 
-            let camera_events = events.clone();
-            let camera_supported = camera::spawn_monitor(move |cameras| {
-                let _ = camera_events.send(Event::Camera(cameras));
-            });
-
             let shared = Arc::new(Shared {
                 settings: Mutex::new(Settings::load(&settings_path)),
-                status: Mutex::new(Status { camera_supported, ..Status::default() }),
+                status: Mutex::new(Status::default()),
                 settings_path,
-                events: events.clone(),
+                events,
             });
             app.manage(shared.clone());
 
             build_tray(app.handle())?;
-            controller::spawn(app.handle().clone(), shared, camera_supported, events_receiver);
+            controller::spawn(app.handle().clone(), shared, events_receiver);
 
             #[cfg(windows)]
             set_efficiency_mode(true);

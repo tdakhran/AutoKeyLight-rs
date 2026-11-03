@@ -221,10 +221,13 @@ impl Monitor {
     }
 }
 
-pub fn spawn_monitor(on_change: OnChange) -> bool {
+/// The listeners stay registered for the life of the app, there's nothing to keep
+pub struct Monitor;
+
+pub fn start_monitor(on_change: OnChange) -> Option<Monitor> {
     let queue = unsafe { dispatch_queue_create(c"camera-monitor".as_ptr(), ptr::null()) };
     if queue.is_null() {
-        return false;
+        return None;
     }
 
     let monitor = Monitor {
@@ -234,15 +237,15 @@ pub fn spawn_monitor(on_change: OnChange) -> bool {
         watched: Mutex::new(Vec::new()),
     };
     if MONITOR.set(monitor).is_err() {
-        return false;
+        return None;
     }
     let monitor = MONITOR.get().unwrap();
 
     // Cameras being plugged in or out
     if monitor.listen(SYSTEM_OBJECT, HARDWARE_PROPERTY_DEVICES) != 0 {
-        return false;
+        return None;
     }
 
     monitor.check();
-    true
+    Some(Monitor)
 }

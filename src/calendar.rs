@@ -2,8 +2,13 @@
 //!
 //! Only what's needed to know when meetings start is read: timed events with their start, recurrence rules, excluded
 //! dates, and moved or cancelled occurrences of recurring meetings. All day and cancelled events are skipped.
+//!
+//! Calendars with years of history can be megabytes, so the download is read line by line and each event is dropped
+//! as soon as it's read. Only meetings within the window the caller asks for are kept. When none of them is still to
+//! come, the first one after the window is kept instead, so the next meeting is known even when it's next week.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
+use std::io::{BufRead, BufReader, Read};
 use std::time::Duration;
 
 use chrono::{DateTime, Local, NaiveDate, NaiveDateTime, TimeZone, Utc};
@@ -11,10 +16,15 @@ use chrono::{DateTime, Local, NaiveDate, NaiveDateTime, TimeZone, Utc};
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 /// Calendars with years of history can be large
 const MAX_CALENDAR_BYTES: u64 = 50 * 1024 * 1024;
-/// Meetings are looked up this far ahead, the calendar is reloaded much more often than this
-const LOOK_AHEAD: chrono::Duration = chrono::Duration::hours(26);
 /// Meetings that started this recently still count, in case the calendar was loaded right after the start
 const LOOK_BEHIND: chrono::Duration = chrono::Duration::minutes(5);
+/// How far ahead the next meeting is looked for, when there's none within the window
+const NEXT_MEETING_HORIZON: chrono::Duration = chrono::Duration::days(366);
+/// Meetings after the window that are kept until the end, in case the earliest ones turn out to be cancelled
+const LATER_CANDIDATES: usize = 8;
+/// Longer lines are cut, only descriptions and attachments get this long and neither is needed
+const MAX_LINE_BYTES: usize = 16 * 1024;
+const READ_BUFFER_BYTES: usize = 16 * 1024;
 
 #[derive(Clone, Debug)]
 pub struct Meeting {
@@ -24,8 +34,9 @@ pub struct Meeting {
     pub key: String,
 }
 
-/// Downloads the calendar and returns the meetings starting soon, sorted by start.
-pub fn fetch(url: &str) -> Result<Vec<Meeting>, String> {
+/// Downloads the calendar and returns the meetings starting within `window`, or the first one after it when none of them
+/// is still to come, sorted by start.
+pub fn fetch(url: &str, window: chrono::Duration) -> Result<Vec<Meeting>, String> {
     let url = url.trim();
     // Calendar apps hand out webcal:// links, they're served over https
     let url = match url.strip_prefix("webcal://") {
@@ -43,21 +54,10 @@ pub fn fetch(url: &str) -> Result<Vec<Meeting>, String> {
     }
 
     let agent: ureq::Agent = ureq::Agent::config_builder().timeout_global(Some(REQUEST_TIMEOUT)).build().into();
-    let calendar = agent
-        .get(&url)
-        .call()
-        .map_err(|error| error.to_string())?
-        .body_mut()
-        .with_config()
-        .limit(MAX_CALENDAR_BYTES)
-        .read_to_string()
-        .map_err(|error| error.to_string())?;
+    let response = agent.get(&url).call().map_err(|error| error.to_string())?;
+    let body = response.into_body().into_with_config().limit(MAX_CALENDAR_BYTES).reader();
 
-    if !calendar.contains("BEGIN:VCALENDAR") {
-        return Err("The link doesn't point to an iCal calendar".to_string());
-    }
-
-    Ok(upcoming_meetings(&calendar, Utc::now()))
+    upcoming_meetings(BufReader::with_capacity(READ_BUFFER_BYTES, body), Utc::now(), window)
 }
 
 struct Property {
@@ -83,18 +83,70 @@ struct Event {
     cancelled: bool,
 }
 
-/// Lines starting with a space or tab continue the previous line
-fn unfold(calendar: &str) -> Vec<String> {
-    let mut lines: Vec<String> = Vec::new();
+/// Reads the calendar's lines one at a time. Lines starting with a space or tab continue the previous line, they're
+/// joined.
+struct Lines<R> {
+    reader: R,
+    /// The next line, read ahead to know whether it continues the current one
+    next: Vec<u8>,
+    done: bool,
+}
 
-    for line in calendar.lines() {
-        match (line.strip_prefix(' ').or_else(|| line.strip_prefix('\t')), lines.last_mut()) {
-            (Some(continuation), Some(previous)) => previous.push_str(continuation),
-            _ => lines.push(line.to_string()),
-        }
+impl<R: BufRead> Lines<R> {
+    fn new(reader: R) -> Self {
+        Self { reader, next: Vec::new(), done: false }
     }
 
-    lines
+    /// Reads a physical line into `buffer`, without its line ending. `false` once there are no more
+    fn read_physical(&mut self, buffer: &mut Vec<u8>) -> Result<bool, String> {
+        buffer.clear();
+        let read = (&mut self.reader)
+            .take(MAX_LINE_BYTES as u64)
+            .read_until(b'\n', buffer)
+            .map_err(|error| error.to_string())?;
+        if read == 0 {
+            return Ok(false);
+        }
+        // Cut off the rest of a line that's too long
+        if read == MAX_LINE_BYTES && buffer.last() != Some(&b'\n') {
+            self.reader.skip_until(b'\n').map_err(|error| error.to_string())?;
+        }
+
+        while buffer.last().is_some_and(|&byte| byte == b'\n' || byte == b'\r') {
+            buffer.pop();
+        }
+        Ok(true)
+    }
+
+    fn next_line(&mut self) -> Result<Option<String>, String> {
+        let mut line = std::mem::take(&mut self.next);
+        if line.is_empty() && !self.done && !self.read_physical(&mut line)? {
+            self.done = true;
+        }
+        if self.done && line.is_empty() {
+            return Ok(None);
+        }
+
+        let mut next = Vec::new();
+        loop {
+            if !self.read_physical(&mut next)? {
+                self.done = true;
+                break;
+            }
+            match next.first() {
+                Some(b' ' | b'\t') => {
+                    let room = MAX_LINE_BYTES.saturating_sub(line.len());
+                    line.extend_from_slice(&next[1..next.len().min(room + 1)]);
+                }
+                _ => {
+                    self.next = next;
+                    break;
+                }
+            }
+        }
+
+        Ok(Some(String::from_utf8_lossy(&line).into_owned()))
+    }
 }
 
 /// `NAME;PARAM=value;PARAM="quoted":value`
@@ -116,44 +168,6 @@ fn parse_property(line: &str) -> Option<Property> {
         .collect();
 
     Some(Property { name, params, value: value.to_string() })
-}
-
-fn parse_events(calendar: &str) -> Vec<Event> {
-    let mut events = Vec::new();
-    let mut current: Option<Event> = None;
-    // Alarms and other components nested in an event have properties that mustn't be mixed up with the event's
-    let mut nested = 0;
-
-    for line in unfold(calendar) {
-        let Some(property) = parse_property(&line) else {
-            continue;
-        };
-
-        match (property.name.as_str(), property.value.as_str()) {
-            ("BEGIN", "VEVENT") => current = Some(Event::default()),
-            ("END", "VEVENT") => events.extend(current.take()),
-            ("BEGIN", _) if current.is_some() => nested += 1,
-            ("END", _) if current.is_some() && nested > 0 => nested -= 1,
-            _ => {}
-        }
-
-        let Some(event) = current.as_mut().filter(|_| nested == 0) else {
-            continue;
-        };
-
-        match property.name.as_str() {
-            "UID" => event.uid = property.value,
-            "SUMMARY" => event.summary = unescape(&property.value),
-            "DTSTART" => event.start = Some(property),
-            "RRULE" => event.rrules.push(property.value),
-            "EXDATE" => event.exdates.push(property),
-            "RECURRENCE-ID" => event.recurrence_id = Some(property),
-            "STATUS" => event.cancelled = property.value.eq_ignore_ascii_case("CANCELLED"),
-            _ => {}
-        }
-    }
-
-    events
 }
 
 fn unescape(text: &str) -> String {
@@ -197,64 +211,210 @@ fn rrule_line(property: &Property) -> String {
     }
 }
 
-/// Start times of a recurring event within `from..until`
-fn occurrences(event: &Event, start: &Property, from: DateTime<Utc>, until: DateTime<Utc>) -> Vec<DateTime<Utc>> {
-    let mut lines = vec![rrule_line(start)];
-    lines.extend(event.rrules.iter().map(|rrule| format!("RRULE:{rrule}")));
-    lines.extend(event.exdates.iter().map(rrule_line));
-
-    let Ok(set) = lines.join("\n").parse::<rrule::RRuleSet>() else {
-        return Vec::new();
-    };
-
-    set.after(from.with_timezone(&rrule::Tz::UTC))
-        .before(until.with_timezone(&rrule::Tz::UTC))
-        .all(100)
-        .dates
-        .into_iter()
-        .map(|time| time.with_timezone(&Utc))
-        .collect()
+/// A meeting occurrence that may still be dropped once the whole calendar is read
+struct Candidate {
+    uid: String,
+    summary: String,
+    start: DateTime<Utc>,
+    /// A moved occurrence of a recurring meeting, it replaces the regular one rather than being replaced
+    is_override: bool,
 }
 
-fn upcoming_meetings(calendar: &str, now: DateTime<Utc>) -> Vec<Meeting> {
-    let (from, until) = (now - LOOK_BEHIND, now + LOOK_AHEAD);
-    let events = parse_events(calendar);
+/// Keeps what's needed from each event as the calendar is read
+struct Collector {
+    now: DateTime<Utc>,
+    from: DateTime<Utc>,
+    window_end: DateTime<Utc>,
+    horizon: DateTime<Utc>,
+    /// Meetings within `from..=window_end`
+    in_window: Vec<Candidate>,
+    /// The earliest meetings after the window, sorted by start, at most `LATER_CANDIDATES`
+    later: Vec<Candidate>,
+    /// Occurrences of recurring meetings that were moved or cancelled, by uid and original start. Only those that
+    /// could replace a kept meeting are remembered
+    overridden: HashSet<(String, i64)>,
+}
 
-    // Occurrences of recurring meetings that were moved or cancelled, they replace the regular occurrence
-    let overridden: HashSet<(String, DateTime<Utc>)> = events
-        .iter()
-        .filter_map(|event| Some((event.uid.clone(), property_to_utc(event.recurrence_id.as_ref()?)?)))
-        .collect();
-
-    let mut meetings: HashMap<String, Meeting> = HashMap::new();
-
-    for event in &events {
-        let Some(start) = event.start.as_ref() else {
-            continue;
-        };
-        if event.cancelled || is_all_day(start) {
-            continue;
-        }
-
-        let starts = if event.rrules.is_empty() || event.recurrence_id.is_some() {
-            property_to_utc(start).into_iter().filter(|start| (from..=until).contains(start)).collect()
-        } else {
-            occurrences(event, start, from, until)
-        };
-
-        for start in starts {
-            if event.recurrence_id.is_none() && overridden.contains(&(event.uid.clone(), start)) {
-                continue;
-            }
-
-            let key = format!("{}@{}", event.uid, start.timestamp());
-            meetings.insert(key.clone(), Meeting { summary: event.summary.clone(), start, key });
+impl Collector {
+    fn new(now: DateTime<Utc>, window: chrono::Duration) -> Self {
+        Self {
+            now,
+            from: now - LOOK_BEHIND,
+            window_end: now + window,
+            horizon: now + NEXT_MEETING_HORIZON,
+            in_window: Vec::new(),
+            later: Vec::new(),
+            overridden: HashSet::new(),
         }
     }
 
-    let mut meetings: Vec<Meeting> = meetings.into_values().collect();
-    meetings.sort_by_key(|meeting| meeting.start);
-    meetings
+    /// Meetings after this can't be kept anymore
+    fn latest_kept(&self) -> DateTime<Utc> {
+        match self.later.get(LATER_CANDIDATES - 1) {
+            Some(last) => last.start,
+            None => self.horizon,
+        }
+    }
+
+    fn add_candidate(&mut self, candidate: Candidate) {
+        if candidate.start < self.from || candidate.start > self.horizon {
+            return;
+        }
+        if candidate.start <= self.window_end {
+            self.in_window.push(candidate);
+            return;
+        }
+
+        let position = self.later.partition_point(|later| later.start <= candidate.start);
+        if position < LATER_CANDIDATES {
+            self.later.insert(position, candidate);
+            self.later.truncate(LATER_CANDIDATES);
+        }
+    }
+
+    fn add_event(&mut self, event: Event) {
+        if let Some(original) = event.recurrence_id.as_ref().and_then(property_to_utc) {
+            if (self.from..=self.latest_kept()).contains(&original) {
+                self.overridden.insert((event.uid.clone(), original.timestamp()));
+            }
+        }
+
+        let Some(start) = event.start.as_ref() else {
+            return;
+        };
+        if event.cancelled || is_all_day(start) {
+            return;
+        }
+
+        let is_override = event.recurrence_id.is_some();
+        let starts = if event.rrules.is_empty() || is_override {
+            property_to_utc(start).into_iter().collect()
+        } else {
+            self.occurrences(&event, start)
+        };
+
+        for start in starts {
+            self.add_candidate(Candidate { uid: event.uid.clone(), summary: event.summary.clone(), start, is_override });
+        }
+    }
+
+    /// Start times of a recurring event within the window, and the first few after it
+    fn occurrences(&self, event: &Event, start: &Property) -> Vec<DateTime<Utc>> {
+        let mut lines = vec![rrule_line(start)];
+        lines.extend(event.rrules.iter().map(|rrule| format!("RRULE:{rrule}")));
+        lines.extend(event.exdates.iter().map(rrule_line));
+
+        let Ok(set) = lines.join("\n").parse::<rrule::RRuleSet>() else {
+            return Vec::new();
+        };
+
+        let utc = |time: DateTime<Utc>| time.with_timezone(&rrule::Tz::UTC);
+        let in_window = set.clone().after(utc(self.from)).before(utc(self.window_end)).all(100).dates;
+        // Several, in case some of them were cancelled
+        let later = set.after(utc(self.window_end)).before(utc(self.latest_kept())).all(LATER_CANDIDATES as u16).dates;
+
+        in_window
+            .into_iter()
+            .chain(later)
+            .map(|time| time.with_timezone(&Utc))
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect()
+    }
+
+    fn finish(self) -> Vec<Meeting> {
+        let overridden = self.overridden;
+        let keep = |candidate: &Candidate| {
+            candidate.is_override || !overridden.contains(&(candidate.uid.clone(), candidate.start.timestamp()))
+        };
+
+        let in_window: Vec<Candidate> = self.in_window.into_iter().filter(keep).collect();
+        // Meetings that started a moment ago are still reminded of, but aren't to come
+        let none_to_come = !in_window.iter().any(|candidate| candidate.start > self.now);
+        // The next meeting then, so it's known even when it's days away
+        let next = self.later.into_iter().filter(keep).take(usize::from(none_to_come));
+
+        let mut meetings: Vec<Meeting> = in_window
+            .into_iter()
+            .chain(next)
+            .map(|candidate| Meeting {
+                key: format!("{}@{}", candidate.uid, candidate.start.timestamp()),
+                summary: candidate.summary,
+                start: candidate.start,
+            })
+            .collect();
+
+        meetings.sort_by_key(|meeting| meeting.start);
+        // The same occurrence can be listed twice, for example in a calendar that was merged from two
+        meetings.dedup_by(|a, b| a.key == b.key);
+        meetings
+    }
+}
+
+/// Meetings starting within `window` of `now`, or the first one after it when none of them is still to come, sorted by
+/// start
+fn upcoming_meetings(reader: impl BufRead, now: DateTime<Utc>, window: chrono::Duration) -> Result<Vec<Meeting>, String> {
+    let mut lines = Lines::new(reader);
+    let mut collector = Collector::new(now, window);
+    let mut is_calendar = false;
+    let mut current: Option<Event> = None;
+    // Alarms and other components nested in an event have properties that mustn't be mixed up with the event's
+    let mut nested = 0;
+
+    while let Some(line) = lines.next_line()? {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let property = parse_property(&line);
+
+        // Stop right away when the link is a web page rather than a calendar, instead of reading all of it
+        if !is_calendar {
+            match &property {
+                Some(property) if property.name == "BEGIN" && property.value.eq_ignore_ascii_case("VCALENDAR") => {
+                    is_calendar = true;
+                    continue;
+                }
+                _ => return Err("The link doesn't point to an iCal calendar".to_string()),
+            }
+        }
+
+        let Some(property) = property else {
+            continue;
+        };
+
+        match (property.name.as_str(), property.value.as_str()) {
+            ("BEGIN", "VEVENT") => current = Some(Event::default()),
+            ("END", "VEVENT") => {
+                if let Some(event) = current.take() {
+                    collector.add_event(event);
+                }
+            }
+            ("BEGIN", _) if current.is_some() => nested += 1,
+            ("END", _) if current.is_some() && nested > 0 => nested -= 1,
+            _ => {}
+        }
+
+        let Some(event) = current.as_mut().filter(|_| nested == 0) else {
+            continue;
+        };
+
+        match property.name.as_str() {
+            "UID" => event.uid = property.value,
+            "SUMMARY" => event.summary = unescape(&property.value),
+            "DTSTART" => event.start = Some(property),
+            "RRULE" => event.rrules.push(property.value),
+            "EXDATE" => event.exdates.push(property),
+            "RECURRENCE-ID" => event.recurrence_id = Some(property),
+            "STATUS" => event.cancelled = property.value.eq_ignore_ascii_case("CANCELLED"),
+            _ => {}
+        }
+    }
+
+    if !is_calendar {
+        return Err("The link doesn't point to an iCal calendar".to_string());
+    }
+
+    Ok(collector.finish())
 }
 
 #[cfg(test)]
@@ -308,29 +468,82 @@ END:VEVENT\r
 END:VCALENDAR\r
 ";
 
-    #[test]
-    fn finds_upcoming_meetings() {
-        let meetings = upcoming_meetings(CALENDAR, at("2026-10-30T08:00:00Z"));
-        let found: Vec<(&str, String)> =
-            meetings.iter().map(|meeting| (meeting.summary.as_str(), meeting.start.to_rfc3339())).collect();
+    fn meetings(calendar: &str, now: &str, window_minutes: i64) -> Vec<(String, String)> {
+        upcoming_meetings(calendar.as_bytes(), at(now), chrono::Duration::minutes(window_minutes))
+            .unwrap()
+            .into_iter()
+            .map(|meeting| (meeting.summary, meeting.start.to_rfc3339()))
+            .collect()
+    }
 
+    fn found(expected: &[(&str, &str)]) -> Vec<(String, String)> {
+        expected.iter().map(|(summary, start)| (summary.to_string(), start.to_string())).collect()
+    }
+
+    #[test]
+    fn keeps_the_meetings_within_the_window() {
         assert_eq!(
-            found,
-            vec![
-                ("One off", "2026-10-30T09:00:00+00:00".to_string()),
+            meetings(CALENDAR, "2026-10-30T08:00:00Z", 8 * 60),
+            found(&[
+                ("One off", "2026-10-30T09:00:00+00:00"),
                 // Moved from 10:00 Berlin time (09:00 UTC) to 11:30 (10:30 UTC)
-                ("Standup moved", "2026-10-30T10:30:00+00:00".to_string()),
-                ("A very long title", "2026-10-30T15:00:00+00:00".to_string()),
-                // The 31st is excluded, the 1st is outside the 26 hours
-            ]
+                ("Standup moved", "2026-10-30T10:30:00+00:00"),
+                ("A very long title", "2026-10-30T15:00:00+00:00"),
+            ])
+        );
+        assert_eq!(meetings(CALENDAR, "2026-10-30T08:45:00Z", 30), found(&[("One off", "2026-10-30T09:00:00+00:00")]));
+    }
+
+    #[test]
+    fn keeps_the_next_meeting_when_none_is_within_the_window() {
+        // The 31st is excluded. Daylight saving time ended in Berlin on October 25th, 10:00 is 09:00 UTC
+        assert_eq!(
+            meetings(CALENDAR, "2026-10-30T16:00:00Z", 30),
+            found(&[("Standup, daily", "2026-11-01T09:00:00+00:00")])
         );
     }
 
     #[test]
-    fn recurring_meetings_follow_their_time_zone() {
-        // Daylight saving time ended in Berlin on October 25th, 10:00 is 09:00 UTC from then on
-        let meetings = upcoming_meetings(CALENDAR, at("2026-11-02T08:00:00Z"));
-        assert_eq!(meetings[0].summary, "Standup, daily");
-        assert_eq!(meetings[0].start, at("2026-11-02T09:00:00Z"));
+    fn meetings_that_just_started_still_count_along_with_the_next() {
+        assert_eq!(
+            meetings(CALENDAR, "2026-10-30T09:03:00Z", 30),
+            found(&[("One off", "2026-10-30T09:00:00+00:00"), ("Standup moved", "2026-10-30T10:30:00+00:00")])
+        );
+    }
+
+    const WEEKLY: &str = "BEGIN:VCALENDAR\r
+BEGIN:VEVENT\r
+UID:weekly\r
+SUMMARY:Weekly\r
+DTSTART:20261002T140000Z\r
+RRULE:FREQ=WEEKLY\r
+END:VEVENT\r
+BEGIN:VEVENT\r
+UID:weekly\r
+SUMMARY:Weekly\r
+RECURRENCE-ID:20261106T140000Z\r
+DTSTART:20261106T140000Z\r
+STATUS:CANCELLED\r
+END:VEVENT\r
+END:VCALENDAR\r
+";
+
+    #[test]
+    fn finds_the_next_meeting_days_ahead_skipping_cancelled_ones() {
+        // The 6th is cancelled, the one after is a week later
+        assert_eq!(meetings(WEEKLY, "2026-11-02T08:00:00Z", 30), found(&[("Weekly", "2026-11-13T14:00:00+00:00")]));
+    }
+
+    #[test]
+    fn rejects_web_pages() {
+        let page = "<!DOCTYPE html>\n<html>BEGIN:VCALENDAR</html>\n";
+        assert!(upcoming_meetings(page.as_bytes(), at("2026-10-30T08:00:00Z"), chrono::Duration::minutes(30)).is_err());
+    }
+
+    #[test]
+    fn cuts_overlong_lines() {
+        let long = "x".repeat(3 * MAX_LINE_BYTES);
+        let calendar = CALENDAR.replace("SUMMARY:One off\r\n", &format!("DESCRIPTION:{long}\r\n {long}\r\nSUMMARY:One off\r\n"));
+        assert_eq!(meetings(&calendar, "2026-10-30T08:45:00Z", 30), found(&[("One off", "2026-10-30T09:00:00+00:00")]));
     }
 }

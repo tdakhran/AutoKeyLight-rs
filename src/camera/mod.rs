@@ -17,20 +17,28 @@ pub fn connected_cameras() -> Vec<String> {
     Vec::new()
 }
 
-/// Starts watching camera usage in the background.
+#[cfg(windows)]
+pub use media_foundation::Monitor;
+#[cfg(target_os = "macos")]
+pub use core_media_io::Monitor;
+#[cfg(not(any(windows, target_os = "macos")))]
+pub struct Monitor;
+
+/// Starts watching camera usage, until the returned monitor is dropped. Doesn't start a thread of its own, on Windows
+/// it needs a thread that stays around while the monitor is kept.
 ///
 /// `on_change` is called with the names of the cameras that are streaming, each time that changes.
-/// An empty list means no camera is in use. Returns `false` if camera detection isn't supported on this platform.
-pub fn spawn_monitor(on_change: impl Fn(Vec<String>) + Send + Sync + 'static) -> bool {
+/// An empty list means no camera is in use. Returns `None` if camera detection isn't supported on this platform.
+pub fn start_monitor(on_change: impl Fn(Vec<String>) + Send + Sync + 'static) -> Option<Monitor> {
     #[cfg(windows)]
-    return media_foundation::spawn_monitor(Box::new(on_change));
+    return media_foundation::start_monitor(Box::new(on_change));
 
     #[cfg(target_os = "macos")]
-    return core_media_io::spawn_monitor(Box::new(on_change));
+    return core_media_io::start_monitor(Box::new(on_change));
 
     #[cfg(not(any(windows, target_os = "macos")))]
     {
         let _ = on_change;
-        false
+        None
     }
 }

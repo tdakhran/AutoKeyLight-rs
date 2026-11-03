@@ -243,11 +243,15 @@ function renderCalendar() {
     detail = formatMeetingTime(calendar.nextMeeting.start);
   } else {
     state = "on";
-    text = "No meetings in the next day";
+    text = "No upcoming meetings";
   }
 
   $("calendar-dot").className = `dot ${state}`;
   setStatusText($("calendar-state"), text, detail);
+
+  const check = $("calendar-check");
+  check.disabled = !settings?.calendarEnabled || !settings?.calendarUrl || calendar.loading;
+  check.textContent = calendar.loading ? "Checking…" : "Check now";
 }
 
 // A status line with an optional smaller second line
@@ -361,6 +365,7 @@ $("flash-interval").addEventListener("change", (event) =>
   saveSettings({ flashIntervalMs: readNumber(event.target, 100, 5000) }),
 );
 $("flash-test").addEventListener("click", () => invoke("flash_lights").catch(showError));
+$("calendar-check").addEventListener("click", () => invoke("check_calendar").catch(showError));
 
 // Tabs, the last one used is remembered
 function showTab(id) {

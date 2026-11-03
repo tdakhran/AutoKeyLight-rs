@@ -4,8 +4,7 @@
 //! so we ask Media Foundation which processes are streaming instead.
 //! https://learn.microsoft.com/en-us/windows/win32/api/mfidl/nn-mfidl-imfsensoractivitymonitor
 
-use std::sync::{mpsc, Mutex, Once};
-use std::thread;
+use std::sync::{Mutex, Once};
 
 use windows::Win32::Media::MediaFoundation::{
     IMFActivate, IMFAttributes, IMFSensorActivitiesReport, IMFSensorActivitiesReportCallback,
@@ -122,39 +121,33 @@ fn enumerate_cameras() -> Result<Vec<String>> {
     }
 }
 
-fn start_monitor(on_change: OnChange) -> Result<IMFSensorActivityMonitor> {
-    unsafe {
-        CoInitializeEx(None, COINIT_MULTITHREADED).ok()?;
-        MFStartup(MF_VERSION, MFSTARTUP_FULL)?;
+/// Reports camera usage for as long as it's kept, they arrive on Media Foundation's own threads
+pub struct Monitor(IMFSensorActivityMonitor);
 
-        let callback: IMFSensorActivitiesReportCallback =
-            ReportCallback { streaming_cameras: Mutex::new(Vec::new()), on_change }.into();
-        let monitor = MFCreateSensorActivityMonitor(&callback)?;
-        monitor.Start()?;
-
-        Ok(monitor)
+impl Drop for Monitor {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = self.0.Stop();
+        }
     }
 }
 
-pub fn spawn_monitor(on_change: OnChange) -> bool {
-    let (started_tx, started_rx) = mpsc::channel();
+/// Joins the calling thread to COM's multithreaded apartment, so it must be a thread that stays around while the
+/// monitor is kept, and that doesn't use COM otherwise
+pub fn start_monitor(on_change: OnChange) -> Option<Monitor> {
+    let started: Result<Monitor> = unsafe {
+        (|| {
+            CoInitializeEx(None, COINIT_MULTITHREADED).ok()?;
+            MFStartup(MF_VERSION, MFSTARTUP_FULL)?;
 
-    let spawned = thread::Builder::new()
-        .name("camera-monitor".into())
-        .spawn(move || match start_monitor(on_change) {
-            Ok(_monitor) => {
-                let _ = started_tx.send(true);
+            let callback: IMFSensorActivitiesReportCallback =
+                ReportCallback { streaming_cameras: Mutex::new(Vec::new()), on_change }.into();
+            let monitor = MFCreateSensorActivityMonitor(&callback)?;
+            monitor.Start()?;
 
-                // Keep the monitor alive, reports arrive on Media Foundation's own threads
-                loop {
-                    thread::park();
-                }
-            }
-            Err(error) => {
-                eprintln!("Camera monitor unavailable: {error}");
-                let _ = started_tx.send(false);
-            }
-        });
+            Ok(Monitor(monitor))
+        })()
+    };
 
-    spawned.is_ok() && started_rx.recv().unwrap_or(false)
+    started.map_err(|error| eprintln!("Camera monitor unavailable: {error}")).ok()
 }

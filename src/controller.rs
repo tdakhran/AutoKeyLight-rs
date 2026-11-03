@@ -38,6 +38,10 @@ const UNLOCK_GRACE: Duration = Duration::from_secs(5);
 const CALENDAR_RETRY_INTERVAL: Duration = Duration::from_secs(5 * 60);
 /// A meeting is still reminded of this long after its start, for example right after waking from sleep
 const REMINDER_GRACE: chrono::Duration = chrono::Duration::minutes(2);
+/// Freed memory is handed back this long after the window closed, once the web view is gone
+const RELEASE_AFTER_WINDOW: Duration = Duration::from_secs(5);
+/// And this long after starting, once everything is set up
+const RELEASE_AFTER_START: Duration = Duration::from_secs(10);
 
 pub enum Event {
     /// Names of the cameras that are streaming, empty when none are, sent when it changes
@@ -55,6 +59,8 @@ pub enum Event {
     CalendarLoaded { url: String, result: Result<Vec<Meeting>, String> },
     /// Blink the lights now, from the Test button
     FlashNow,
+    /// Load the calendar now, from the Check now button
+    CheckCalendar,
 }
 
 #[derive(Clone, Copy, PartialEq, Serialize)]
@@ -95,7 +101,7 @@ pub struct Status {
 pub struct CalendarStatus {
     pub loading: bool,
     pub error: Option<String>,
-    /// Number of meetings found in the next day, once the calendar loaded
+    /// Number of meetings kept from the calendar, once it loaded
     pub upcoming: Option<usize>,
     pub next_meeting: Option<NextMeeting>,
 }
@@ -115,7 +121,7 @@ pub struct Shared {
     pub events: Sender<Event>,
 }
 
-pub fn spawn(app: AppHandle, shared: Arc<Shared>, camera_supported: bool, events: Receiver<Event>) {
+pub fn spawn(app: AppHandle, shared: Arc<Shared>, events: Receiver<Event>) {
     // Lights found before, so the camera can switch them right after login without discovering them first
     let known_lights_path = shared.settings_path.with_file_name("lights.json");
     let found = discovery::load_known(&known_lights_path);
@@ -130,7 +136,7 @@ pub fn spawn(app: AppHandle, shared: Arc<Shared>, camera_supported: bool, events
         discover_until: Some(Instant::now() + DISCOVERY_WINDOW),
         found_this_discovery: HashSet::new(),
         expected_lights: HashSet::new(),
-        camera_supported,
+        camera_supported: false,
         camera_on: false,
         cameras: Vec::new(),
         camera_changed_at: Instant::now(),
@@ -150,6 +156,7 @@ pub fn spawn(app: AppHandle, shared: Arc<Shared>, camera_supported: bool, events
         reminded: HashSet::new(),
         flash_requested: false,
         flash_cancel: None,
+        release_memory_at: Some(Instant::now() + RELEASE_AFTER_START),
     };
 
     thread::Builder::new()
@@ -201,7 +208,7 @@ struct Controller {
     /// When the calendar last finished loading, the next load is scheduled from it
     calendar_last_load: Option<Instant>,
     calendar_error: Option<String>,
-    /// Meetings in the next day, `None` until the calendar loaded
+    /// Meetings within twice the check period, or the next one when there's none, `None` until the calendar loaded
     meetings: Option<Vec<Meeting>>,
     next_calendar_load: Instant,
     /// Meeting occurrences the lights already blinked for
@@ -209,10 +216,19 @@ struct Controller {
     flash_requested: bool,
     /// Set to stop the blinking that's running
     flash_cancel: Option<Arc<AtomicBool>>,
+    /// When to hand freed memory back to the system, after a burst of work. Only while the window is closed
+    release_memory_at: Option<Instant>,
 }
 
 impl Controller {
     fn run(mut self, events: Receiver<Event>) {
+        // Kept on this thread, which lives as long as the app, rather than a thread of its own
+        let camera_events = self.shared.events.clone();
+        let _camera_monitor = crate::camera::start_monitor(move |cameras| {
+            let _ = camera_events.send(Event::Camera(cameras));
+        });
+        self.camera_supported = _camera_monitor.is_some();
+
         loop {
             let settings = self.shared.settings.lock().unwrap().clone();
             self.update(&settings);
@@ -271,7 +287,11 @@ impl Controller {
                 self.window_open = true;
                 self.next_refresh = Instant::now();
             }
-            Event::WindowHidden => self.window_open = false,
+            Event::WindowHidden => {
+                self.window_open = false;
+                self.light_states.clear();
+                self.release_memory_at = Some(Instant::now() + RELEASE_AFTER_WINDOW);
+            }
             Event::SettingsChanged { newly_tracked } => {
                 let settings = self.shared.settings.lock().unwrap().clone();
                 let targets: Vec<Target> = self
@@ -311,9 +331,12 @@ impl Controller {
 
                 self.calendar_loading = false;
                 self.calendar_last_load = Some(Instant::now());
+                self.release_memory_at = Some(Instant::now());
                 match result {
                     Ok(meetings) => {
-                        log(format_args!("controller: calendar loaded, {} meetings in the next day", meetings.len()));
+                        log(format_args!("controller: calendar loaded, kept {} meetings", meetings.len()));
+                        // Meetings that are no longer listed have passed, there's nothing left to remind of
+                        self.reminded.retain(|key| meetings.iter().any(|meeting| &meeting.key == key));
                         self.calendar_error = None;
                         self.meetings = Some(meetings);
                     }
@@ -324,6 +347,12 @@ impl Controller {
                 }
             }
             Event::FlashNow => self.flash_requested = true,
+            // Scheduled from the last load, without one it's due right away. One that's running already counts
+            Event::CheckCalendar => {
+                if !self.calendar_loading {
+                    self.calendar_last_load = None;
+                }
+            }
         }
     }
 
@@ -372,14 +401,17 @@ impl Controller {
             .spawn(move || lights.flash(&addresses, count, interval, &cancel));
     }
 
-    fn start_calendar_load(&mut self) {
+    fn start_calendar_load(&mut self, settings: &Settings) {
         self.calendar_loading = true;
 
         let url = self.calendar_url.clone();
         let events = self.shared.events.clone();
+        // Twice the check period, so a check that fails or comes late doesn't miss a meeting. When there's none in it,
+        // the next meeting is kept instead, however far ahead it is
+        let window = chrono::Duration::minutes(settings.calendar_refresh_minutes as i64 * 2);
 
         let spawned = thread::Builder::new().name("calendar".into()).spawn(move || {
-            let result = calendar::fetch(&url);
+            let result = calendar::fetch(&url, window);
             let _ = events.send(Event::CalendarLoaded { url, result });
         });
 
@@ -403,6 +435,7 @@ impl Controller {
         let calendar_load = (!self.calendar_url.is_empty() && !self.calendar_loading).then_some(self.next_calendar_load);
         // Check the camera again once cameras stop being ignored after unlocking
         let unlock_grace = self.ignore_cameras_until.filter(|until| !self.cameras.is_empty() && *until > Instant::now());
+        let release_memory = self.release_memory_at.filter(|_| !self.window_open);
 
         [
             self.switch_deadline(settings),
@@ -412,6 +445,7 @@ impl Controller {
             self.next_meeting_deadline(),
             unlock_grace,
             self.discover_until,
+            release_memory,
         ]
             .into_iter()
             .flatten()
@@ -440,6 +474,7 @@ impl Controller {
             }
         } else if !wanted && self.discovery.is_some() {
             self.discovery = None;
+            self.release_memory_at.get_or_insert(now);
         }
     }
 
@@ -503,6 +538,12 @@ impl Controller {
         if self.window_open && !self.refreshing && Instant::now() >= self.next_refresh {
             self.start_refresh();
         }
+
+        // Last, after this update's own work. The window's own memory is far larger, it's not worth it while it's open
+        if !self.window_open && self.release_memory_at.is_some_and(|at| Instant::now() >= at) {
+            self.release_memory_at = None;
+            crate::memory::release();
+        }
     }
 
     fn update_calendar(&mut self, settings: &Settings) {
@@ -523,7 +564,7 @@ impl Controller {
         self.next_calendar_load = self.calendar_last_load.map_or_else(Instant::now, |last| last + wait);
 
         if !self.calendar_url.is_empty() && !self.calendar_loading && Instant::now() >= self.next_calendar_load {
-            self.start_calendar_load();
+            self.start_calendar_load(settings);
         }
 
         // Blink once per meeting, even when several start at the same time

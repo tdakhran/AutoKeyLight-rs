@@ -243,6 +243,7 @@ dependencies = [
  "tauri-plugin-autostart",
  "tauri-plugin-opener",
  "tauri-plugin-single-instance",
+ "tokio",
  "ureq",
  "windows",
  "windows-core",

@@ -23,6 +23,8 @@ tauri-plugin-opener = "2"
 chrono = "0.4"
 chrono-tz = "0.10"
 rrule = "0.14"
+# Only to size the runtime Tauri uses, it already depends on tokio
+tokio = { version = "1", features = ["rt-multi-thread"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 block2 = "0.6"
@@ -31,6 +33,7 @@ block2 = "0.6"
 windows = { version = "0.62", features = [
     "Win32_Media_MediaFoundation",
     "Win32_System_Com",
+    "Win32_System_Memory",
     "Win32_System_RemoteDesktop",
     "Win32_System_Threading",
 ] }
