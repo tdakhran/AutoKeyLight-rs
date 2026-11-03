@@ -141,7 +141,8 @@ pub fn spawn(app: AppHandle, shared: Arc<Shared>, events: Receiver<Event>) {
         cameras: Vec::new(),
         camera_changed_at: Instant::now(),
         lights_camera_state: false,
-        retry: None,
+        missed: HashSet::new(),
+        retry_at: None,
         ignore_cameras_until: None,
         window_open: false,
         refreshing: false,
@@ -163,12 +164,6 @@ pub fn spawn(app: AppHandle, shared: Arc<Shared>, events: Receiver<Event>) {
         .name("controller".into())
         .spawn(move || controller.run(events))
         .expect("failed to spawn controller thread");
-}
-
-/// Lights that didn't respond to a switch, retried once
-struct Retry {
-    at: Instant,
-    targets: Vec<Target>,
 }
 
 struct Controller {
@@ -193,7 +188,10 @@ struct Controller {
     camera_changed_at: Instant,
     /// Camera state the lights were last switched for, starts as off so the lights are only touched once the camera turns on
     lights_camera_state: bool,
-    retry: Option<Retry>,
+    /// Ids of tracked lights that didn't take the last camera switch. Retried once by `retry_at`, then switched as soon
+    /// as discovery finds them again, at their address then
+    missed: HashSet<String>,
+    retry_at: Option<Instant>,
     /// Set while the computer is locked and shortly after, cameras don't count until then
     ignore_cameras_until: Option<Instant>,
     window_open: bool,
@@ -260,6 +258,7 @@ impl Controller {
             }
             Event::LightFound(light) => {
                 self.found_this_discovery.insert(light.id.clone());
+                let id = light.id.clone();
 
                 let changed = match self.found.iter_mut().find(|found| found.id == light.id) {
                     Some(found) if *found == light => false,
@@ -276,6 +275,17 @@ impl Controller {
                 if changed {
                     self.found.sort_by(|a, b| a.name.cmp(&b.name));
                     discovery::save_known(&self.known_lights_path, &self.found);
+                }
+
+                // A light that missed the camera switch is back, at its new address or the old one. Unless the retry is
+                // still to come, it's switched now rather than at the camera's next change
+                if self.missed.contains(&id) && self.retry_at.is_none() {
+                    log("controller: found a light that missed the camera switch");
+                    let settings = self.shared.settings.lock().unwrap().clone();
+                    let still_missed = self.switch(&settings, &HashSet::from([id.clone()]));
+                    if !still_missed.contains(&id) {
+                        self.missed.remove(&id);
+                    }
                 }
                 self.next_refresh = Instant::now();
             }
@@ -356,6 +366,28 @@ impl Controller {
         }
     }
 
+    /// Switches the tracked lights with these ids to the camera state, at their current address. Returns the ids of the
+    /// lights that didn't take it, lights that aren't found count as not taking it
+    fn switch(&self, settings: &Settings, ids: &HashSet<String>) -> HashSet<String> {
+        let lights: Vec<&DiscoveredLight> =
+            self.found.iter().filter(|light| ids.contains(&light.id) && settings.is_tracked(&light.id)).collect();
+        let targets: Vec<Target> =
+            lights.iter().map(|light| (light.address.clone(), settings.brightness_for(&light.id))).collect();
+
+        log(format_args!("controller: switching {} lights on={}", targets.len(), self.lights_camera_state));
+        let failed = self.lights.set_all_on(&targets, self.lights_camera_state);
+
+        let mut missed: HashSet<String> = ids.iter().filter(|id| !lights.iter().any(|light| &light.id == *id)).cloned().collect();
+        missed.retain(|id| settings.is_tracked(id));
+        missed.extend(
+            lights
+                .into_iter()
+                .filter(|light| failed.iter().any(|(address, _)| *address == light.address))
+                .map(|light| light.id.clone()),
+        );
+        missed
+    }
+
     /// Tracked lights with the brightness the camera turns each on at
     fn tracked_targets(&self, settings: &Settings) -> Vec<Target> {
         self.found
@@ -431,7 +463,7 @@ impl Controller {
     fn next_deadline(&self, settings: &Settings) -> Option<Instant> {
         // Light states are only needed to show them in the window
         let refresh = (self.window_open && !self.refreshing).then_some(self.next_refresh);
-        let retry = self.retry.as_ref().map(|retry| retry.at);
+        let retry = self.retry_at;
         let calendar_load = (!self.calendar_url.is_empty() && !self.calendar_loading).then_some(self.next_calendar_load);
         // Check the camera again once cameras stop being ignored after unlocking
         let unlock_grace = self.ignore_cameras_until.filter(|until| !self.cameras.is_empty() && *until > Instant::now());
@@ -494,8 +526,9 @@ impl Controller {
         if camera_on != self.camera_on {
             self.camera_on = camera_on;
             self.camera_changed_at = Instant::now();
-            // A pending retry was for the previous camera state
-            self.retry = None;
+            // Missed lights were for the previous camera state
+            self.missed.clear();
+            self.retry_at = None;
             // The camera wins over a reminder, restoring the lights afterwards would undo the switch
             self.cancel_flash();
         }
@@ -507,29 +540,33 @@ impl Controller {
         // change, rather than switching right away
         if !settings.camera_enabled {
             self.lights_camera_state = self.camera_on;
-            self.retry = None;
+            self.missed.clear();
+            self.retry_at = None;
         }
 
         // Show camera changes right away, before talking to the lights
         self.publish_status(settings);
 
         if self.switch_deadline(settings).is_some_and(|deadline| Instant::now() >= deadline) {
-            let tracked = self.tracked_targets(settings);
+            let tracked: HashSet<String> = self.found.iter().map(|light| light.id.clone()).collect();
 
-            log(format_args!("controller: switching {} lights on={}", tracked.len(), self.camera_on));
-            let failed = self.lights.set_all_on(&tracked, self.camera_on);
             self.lights_camera_state = self.camera_on;
+            self.missed = self.switch(settings, &tracked);
 
-            // Retry once, only the lights that didn't respond, then leave them until the camera changes again
-            self.retry = (!failed.is_empty()).then(|| Retry { at: Instant::now() + RETRY_DELAY, targets: failed });
+            // Retry once, only the lights that didn't respond
+            self.retry_at = (!self.missed.is_empty()).then(|| Instant::now() + RETRY_DELAY);
 
             // Show the new light states right away
             self.next_refresh = Instant::now();
-        } else if let Some(retry) = self.retry.take_if(|retry| Instant::now() >= retry.at) {
-            log(format_args!("controller: retrying {} lights", retry.targets.len()));
-            let failed = self.lights.set_all_on(&retry.targets, self.camera_on);
-            // Most likely the light got a new address, look for it again
-            if !failed.is_empty() {
+        } else if self.retry_at.is_some_and(|at| Instant::now() >= at) {
+            self.retry_at = None;
+            log(format_args!("controller: retrying {} lights", self.missed.len()));
+            // At their current address, discovery may have found a new one since
+            let missed = std::mem::take(&mut self.missed);
+            self.missed = self.switch(settings, &missed);
+
+            // Most likely the light got a new address, look for it again. It's switched once it's found
+            if !self.missed.is_empty() {
                 self.discover_until = Some(Instant::now() + DISCOVERY_WINDOW);
             }
             self.next_refresh = Instant::now();
