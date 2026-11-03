@@ -250,10 +250,6 @@ fn main() {
             });
             app.manage(shared.clone());
 
-            if let Err(error) = discovery::spawn(events) {
-                log::log(format_args!("discovery unavailable: {error}"));
-            }
-
             build_tray(app.handle())?;
             controller::spawn(app.handle().clone(), shared, camera_supported, events_receiver);
 

@@ -19,7 +19,7 @@ use serde::Serialize;
 use tauri::{AppHandle, Emitter};
 
 use crate::calendar::{self, Meeting};
-use crate::discovery::DiscoveredLight;
+use crate::discovery::{self, DiscoveredLight, Discovery};
 use crate::lights::{Lights, Reading, Target};
 use crate::log::log;
 use crate::settings::Settings;
@@ -29,6 +29,8 @@ pub const MAIN_WINDOW: &str = "main";
 /// How often light states are refreshed while the window is open
 const REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 const RETRY_DELAY: Duration = Duration::from_secs(1);
+/// How long lights are looked for at startup, or after one stopped answering, unless all of them answer sooner
+const DISCOVERY_WINDOW: Duration = Duration::from_secs(60);
 /// Cameras are ignored this long after the computer was last seen locked, face recognition at login (Windows Hello)
 /// keeps streaming for a moment after unlocking
 const UNLOCK_GRACE: Duration = Duration::from_secs(5);
@@ -114,11 +116,20 @@ pub struct Shared {
 }
 
 pub fn spawn(app: AppHandle, shared: Arc<Shared>, camera_supported: bool, events: Receiver<Event>) {
+    // Lights found before, so the camera can switch them right after login without discovering them first
+    let known_lights_path = shared.settings_path.with_file_name("lights.json");
+    let found = discovery::load_known(&known_lights_path);
+
     let controller = Controller {
         app,
         shared,
         lights: Lights::new(),
-        found: Vec::new(),
+        found,
+        known_lights_path,
+        discovery: None,
+        discover_until: Some(Instant::now() + DISCOVERY_WINDOW),
+        found_this_discovery: HashSet::new(),
+        expected_lights: HashSet::new(),
         camera_supported,
         camera_on: false,
         cameras: Vec::new(),
@@ -159,6 +170,16 @@ struct Controller {
     lights: Lights,
     /// Lights found on the network, sorted by name
     found: Vec<DiscoveredLight>,
+    /// Where `found` is saved
+    known_lights_path: PathBuf,
+    /// Running while the window is open, while no lights are known, and until `discover_until`
+    discovery: Option<Discovery>,
+    /// Look for lights until then, at startup or after a light stopped answering
+    discover_until: Option<Instant>,
+    /// Ids of the lights that answered since discovery started
+    found_this_discovery: HashSet<String>,
+    /// Ids of the lights known when discovery started
+    expected_lights: HashSet<String>,
     camera_supported: bool,
     camera_on: bool,
     cameras: Vec<String>,
@@ -222,14 +243,30 @@ impl Controller {
                 self.cameras = cameras;
             }
             Event::LightFound(light) => {
-                match self.found.iter_mut().find(|found| found.id == light.id) {
-                    Some(found) => *found = light,
-                    None => self.found.push(light),
+                self.found_this_discovery.insert(light.id.clone());
+
+                let changed = match self.found.iter_mut().find(|found| found.id == light.id) {
+                    Some(found) if *found == light => false,
+                    Some(found) => {
+                        *found = light;
+                        true
+                    }
+                    None => {
+                        self.found.push(light);
+                        true
+                    }
+                };
+
+                if changed {
+                    self.found.sort_by(|a, b| a.name.cmp(&b.name));
+                    discovery::save_known(&self.known_lights_path, &self.found);
                 }
-                self.found.sort_by(|a, b| a.name.cmp(&b.name));
                 self.next_refresh = Instant::now();
             }
-            Event::LightLost(fullname) => self.found.retain(|light| light.fullname != fullname),
+            Event::LightLost(fullname) => {
+                self.found.retain(|light| light.fullname != fullname);
+                discovery::save_known(&self.known_lights_path, &self.found);
+            }
             Event::WindowShown => {
                 self.window_open = true;
                 self.next_refresh = Instant::now();
@@ -367,13 +404,48 @@ impl Controller {
         // Check the camera again once cameras stop being ignored after unlocking
         let unlock_grace = self.ignore_cameras_until.filter(|until| !self.cameras.is_empty() && *until > Instant::now());
 
-        [self.switch_deadline(settings), retry, refresh, calendar_load, self.next_meeting_deadline(), unlock_grace]
+        [
+            self.switch_deadline(settings),
+            retry,
+            refresh,
+            calendar_load,
+            self.next_meeting_deadline(),
+            unlock_grace,
+            self.discover_until,
+        ]
             .into_iter()
             .flatten()
             .min()
     }
 
+    /// Runs discovery only while it's needed, the rest of the time no mDNS traffic is received
+    fn update_discovery(&mut self) {
+        let now = Instant::now();
+
+        // Done early once every light known when it started answered. With none known, it looks for the whole window, to
+        // find every light rather than stopping at the first
+        let all_answered = !self.expected_lights.is_empty() && self.expected_lights.is_subset(&self.found_this_discovery);
+        if self.discover_until.is_some_and(|until| now >= until || all_answered) {
+            self.discover_until = None;
+        }
+
+        let wanted = self.window_open || self.found.is_empty() || self.discover_until.is_some();
+
+        if wanted && self.discovery.is_none() {
+            self.found_this_discovery.clear();
+            self.expected_lights = self.found.iter().map(|light| light.id.clone()).collect();
+            match discovery::start(self.shared.events.clone()) {
+                Ok(discovery) => self.discovery = Some(discovery),
+                Err(error) => log(format_args!("discovery unavailable: {error}")),
+            }
+        } else if !wanted && self.discovery.is_some() {
+            self.discovery = None;
+        }
+    }
+
     fn update(&mut self, settings: &Settings) {
+        self.update_discovery();
+
         // Logging in with face recognition uses the camera, that mustn't turn the lights on. Only checked while a camera
         // is streaming
         let now = Instant::now();
@@ -420,7 +492,11 @@ impl Controller {
             self.next_refresh = Instant::now();
         } else if let Some(retry) = self.retry.take_if(|retry| Instant::now() >= retry.at) {
             log(format_args!("controller: retrying {} lights", retry.targets.len()));
-            self.lights.set_all_on(&retry.targets, self.camera_on);
+            let failed = self.lights.set_all_on(&retry.targets, self.camera_on);
+            // Most likely the light got a new address, look for it again
+            if !failed.is_empty() {
+                self.discover_until = Some(Instant::now() + DISCOVERY_WINDOW);
+            }
             self.next_refresh = Instant::now();
         }
 
