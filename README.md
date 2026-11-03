@@ -10,14 +10,26 @@ by [Gabriel Garcia (@astutejoe)](https://github.com/astutejoe), the original Win
 ## Features
 
 - Lives in the tray (menu bar on macOS), click the icon for settings
-- Finds your lights on the network automatically, no IP addresses to enter
+- Finds your lights on the network automatically, no IP addresses to enter. Looks for them again at every start to
+  pick up changed addresses, until then the last known ones are used
 - **Camera:** lights switch only when the camera turns on or off, so lights you switch yourself stay that way.
   Optional delays before turning them on or off
+  - The camera turns lights on at a brightness you choose, the same for all lights (20% by default) or one per light
+  - Choose which cameras count, for example only your webcam and not the laptop's built-in camera
+  - Optionally ignore the camera at the login screen, so face recognition (Windows Hello) doesn't turn the lights on
 - **Calendar:** lights blink when a meeting starts, then go back the way they were. Uses your calendar's private iCal
-  link, for example Google Calendar's *Secret address in iCal format*. No blinking while the computer is locked
+  link, for example Google Calendar's *Secret address in iCal format*. No blinking while the computer is locked.
+  **Check now** loads the calendar right away
 - Turn the camera or calendar trigger on and off separately, **Track** or **Untrack** each light, start at login
-- Event driven, nothing runs in the background until the camera changes or a meeting starts, apart from checking the
-  calendar for changes (every 15 minutes by default)
+- Light on resources:
+  - **Event driven:** nothing runs in the background until the camera changes or a meeting starts, apart from checking
+    the calendar for changes (every 15 minutes by default)
+  - **Network:** lights are looked for only while the settings window is open, at startup, or when a light stopped
+    answering
+  - **Settings window:** closed rather than hidden, so its web view doesn't keep running in the background
+  - **Memory:** of the calendar, only meetings within the next two checks are kept, or the next meeting if there are
+    none. Freed memory goes back to the system
+  - **Windows:** in efficiency mode while in the tray (the leaf in Task Manager)
 
 ## Install
 
