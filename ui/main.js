@@ -35,6 +35,23 @@ function setTracked(id, tracked) {
   saveSettings({ untrackedLights: tracked ? untracked : [...untracked, id] });
 }
 
+/// Brightness the camera turns the light on at, `null` keeps the light's own
+function brightnessFor(id) {
+  return settings.syncBrightness ? settings.brightness : (settings.lightBrightness[id] ?? null);
+}
+
+function setBrightness(id, brightness) {
+  if (settings.syncBrightness) {
+    saveSettings({ brightness });
+    return;
+  }
+
+  const lightBrightness = { ...settings.lightBrightness };
+  if (brightness === null) delete lightBrightness[id];
+  else lightBrightness[id] = brightness;
+  saveSettings({ lightBrightness });
+}
+
 // Rows by light id, so status updates change them in place instead of rebuilding the list under the cursor
 const lightRows = new Map();
 let renderedLights = "";
@@ -53,7 +70,9 @@ function renderLights() {
     const row = lightRows.get(light.id);
     const state = LIGHT_STATES[light.state];
     row.dot.className = `dot ${state.className}`;
-    row.state.textContent = state.text;
+    row.state.textContent = light.state === "on" && light.brightness !== null ? `on ${light.brightness}%` : state.text;
+    // Don't overwrite a value that's being typed
+    if (document.activeElement !== row.brightness) row.brightness.value = brightnessFor(light.id) ?? "";
   }
 
   $("no-lights").hidden = lights.length > 0;
@@ -83,6 +102,21 @@ function buildLightRows(lights) {
     const state = document.createElement("span");
     state.className = "state";
 
+    const brightness = document.createElement("input");
+    brightness.type = "number";
+    brightness.min = 1;
+    brightness.max = 100;
+    brightness.placeholder = "–";
+    brightness.title = "Brightness the camera turns this light on at";
+    brightness.addEventListener("change", () => {
+      const value = brightness.value === "" ? null : readNumber(brightness, 1, 100);
+      setBrightness(light.id, value);
+    });
+
+    const percent = document.createElement("span");
+    percent.className = "brightness";
+    percent.append(brightness, "%");
+
     const track = document.createElement("button");
     track.className = light.tracked ? "small" : "small primary";
     track.textContent = light.tracked ? "Untrack" : "Track";
@@ -90,14 +124,15 @@ function buildLightRows(lights) {
 
     const item = document.createElement("li");
     item.classList.toggle("disabled", !light.tracked);
-    item.append(dot, label, state, track);
+    item.append(dot, label, state, percent, track);
     list.append(item);
 
-    lightRows.set(light.id, { dot, state });
+    lightRows.set(light.id, { dot, state, brightness });
   }
 }
 
 function renderSettings() {
+  $("sync-brightness").checked = settings.syncBrightness;
   $("camera-enabled").checked = settings.cameraEnabled;
   $("calendar-enabled").checked = settings.calendarEnabled;
   $("on-delay").value = settings.cameraOnDelayMs;
@@ -194,6 +229,27 @@ function readNumber(input, min, max) {
   input.value = value;
   return value;
 }
+
+$("sync-brightness").addEventListener("change", (event) => {
+  const changes = { syncBrightness: event.target.checked };
+
+  // Switching either way keeps what's shown, values only change when they're edited
+  const lights = status?.lights ?? [];
+  if (event.target.checked) {
+    // The lights may differ, the first one's value becomes the shared one
+    if (lights.length > 0) changes.brightness = settings.lightBrightness[lights[0].id] ?? null;
+  } else {
+    // Every light starts from the shared value
+    const lightBrightness = { ...settings.lightBrightness };
+    for (const light of lights) {
+      if (settings.brightness === null) delete lightBrightness[light.id];
+      else lightBrightness[light.id] = settings.brightness;
+    }
+    changes.lightBrightness = lightBrightness;
+  }
+
+  saveSettings(changes);
+});
 
 $("camera-enabled").addEventListener("change", (event) => saveSettings({ cameraEnabled: event.target.checked }));
 $("calendar-enabled").addEventListener("change", (event) => saveSettings({ calendarEnabled: event.target.checked }));

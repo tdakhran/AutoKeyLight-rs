@@ -173,6 +173,19 @@ h2 {
   font-size: 12px;
 }
 
+#lights .brightness {
+  color: var(--muted);
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+#lights .brightness input {
+  width: 42px;
+  padding: 2px 4px;
+  margin-right: 2px;
+  font-size: 12px;
+}
+
 #lights li.disabled .label,
 #lights li.disabled .state {
   opacity: 0.5;

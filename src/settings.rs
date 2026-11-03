@@ -1,5 +1,6 @@
 //! User settings, stored as JSON in the app's config directory.
 
+use std::collections::HashMap;
 use std::fs;
 use std::io;
 use std::path::Path;
@@ -11,6 +12,12 @@ use serde::{Deserialize, Serialize};
 pub struct Settings {
     /// Ids of discovered lights that are left alone, new lights are tracked
     pub untracked_lights: Vec<String>,
+    /// Brightness in percent the camera turns each light on at, by light id. Lights without one keep their own
+    pub light_brightness: HashMap<String, u8>,
+    /// Use `brightness` for every light instead of `light_brightness`
+    pub sync_brightness: bool,
+    /// Brightness in percent for every light while synced, `None` keeps each light's own
+    pub brightness: Option<u8>,
     /// Switch the tracked lights with the camera
     pub camera_enabled: bool,
     pub camera_on_delay_ms: u64,
@@ -30,6 +37,9 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             untracked_lights: Vec::new(),
+            light_brightness: HashMap::new(),
+            sync_brightness: true,
+            brightness: Some(20),
             camera_enabled: true,
             camera_on_delay_ms: 0,
             camera_off_delay_ms: 0,
@@ -59,13 +69,26 @@ impl Settings {
         fs::write(path, serde_json::to_string_pretty(self)?)
     }
 
-    /// Keeps the blinking within sensible limits, whatever the window sent
+    /// Keeps values within sensible limits, whatever the window sent
     pub fn clamped(mut self) -> Self {
+        self.brightness = self.brightness.map(|brightness| brightness.clamp(1, 100));
+        for brightness in self.light_brightness.values_mut() {
+            *brightness = (*brightness).clamp(1, 100);
+        }
         self.calendar_url = self.calendar_url.trim().to_string();
         self.calendar_refresh_minutes = self.calendar_refresh_minutes.clamp(1, 120);
         self.flash_count = self.flash_count.clamp(1, 10);
         self.flash_interval_ms = self.flash_interval_ms.clamp(100, 5000);
         self
+    }
+
+    /// Brightness to turn the light on at, `None` keeps the light's own
+    pub fn brightness_for(&self, id: &str) -> Option<u8> {
+        if self.sync_brightness {
+            self.brightness
+        } else {
+            self.light_brightness.get(id).copied()
+        }
     }
 
     pub fn is_tracked(&self, id: &str) -> bool {

@@ -18,7 +18,14 @@
       <div class="tab-panel" id="lights-tab">
         <section>
           <h2>Lights</h2>
-          <p class="hint">Tracked lights follow the camera and blink for meetings.</p>
+          <p class="hint">
+            Tracked lights follow the camera and blink for meetings. The camera turns them on at the brightness set
+            here, leave it empty to keep the light's own.
+          </p>
+          <label class="check">
+            <input id="sync-brightness" type="checkbox" />
+            <span>Same brightness for all lights</span>
+          </label>
           <ul id="lights"></ul>
           <p class="empty" id="no-lights" hidden>Looking for lights on your network…</p>
         </section>

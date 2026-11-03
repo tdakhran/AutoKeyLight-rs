@@ -20,7 +20,7 @@ use tauri::{AppHandle, Emitter};
 
 use crate::calendar::{self, Meeting};
 use crate::discovery::DiscoveredLight;
-use crate::lights::Lights;
+use crate::lights::{Lights, Reading, Target};
 use crate::log::log;
 use crate::settings::Settings;
 
@@ -45,7 +45,7 @@ pub enum Event {
     /// Ids of lights that were just tracked, they're switched to match the other tracked lights right away
     SettingsChanged { newly_tracked: Vec<String> },
     /// Result of a background refresh, whether each light is on by id, `None` if it couldn't be reached
-    LightsRefreshed(Vec<(String, Option<bool>)>),
+    LightsRefreshed(Vec<(String, Option<Reading>)>),
     /// Result of loading the calendar from `url`
     CalendarLoaded { url: String, result: Result<Vec<Meeting>, String> },
     /// Blink the lights now, from the Test button
@@ -69,6 +69,8 @@ pub struct LightStatus {
     pub name: String,
     pub address: String,
     pub state: LightState,
+    /// Current brightness in percent, while the light can be reached
+    pub brightness: Option<u8>,
     pub tracked: bool,
 }
 
@@ -144,7 +146,7 @@ pub fn spawn(app: AppHandle, shared: Arc<Shared>, camera_supported: bool, events
 /// Lights that didn't respond to a switch, retried once
 struct Retry {
     at: Instant,
-    addresses: Vec<String>,
+    targets: Vec<Target>,
 }
 
 struct Controller {
@@ -164,8 +166,8 @@ struct Controller {
     /// Whether a background refresh of the light states is running
     refreshing: bool,
     next_refresh: Instant,
-    /// Last queried light states by id
-    light_states: HashMap<String, LightState>,
+    /// Last queried light states and brightness by id
+    light_states: HashMap<String, (LightState, Option<u8>)>,
     /// Calendar link the meetings below are from
     calendar_url: String,
     calendar_loading: bool,
@@ -237,18 +239,18 @@ impl Controller {
             }
             Event::WindowHidden => self.window_open = false,
             Event::SettingsChanged { newly_tracked } => {
-                let addresses: Vec<String> = self
+                let settings = self.shared.settings.lock().unwrap().clone();
+                let targets: Vec<Target> = self
                     .found
                     .iter()
                     .filter(|light| newly_tracked.contains(&light.id))
-                    .map(|light| light.address.clone())
+                    .map(|light| (light.address.clone(), settings.brightness_for(&light.id)))
                     .collect();
 
                 // Only while the camera trigger is on, otherwise there's no camera state to match
-                let camera_enabled = self.shared.settings.lock().unwrap().camera_enabled;
-                if camera_enabled && !addresses.is_empty() {
-                    log(format_args!("controller: tracking {} lights on={}", addresses.len(), self.lights_camera_state));
-                    self.lights.set_all_on(&addresses, self.lights_camera_state);
+                if settings.camera_enabled && !targets.is_empty() {
+                    log(format_args!("controller: tracking {} lights on={}", targets.len(), self.lights_camera_state));
+                    self.lights.set_all_on(&targets, self.lights_camera_state);
                     self.next_refresh = Instant::now();
                 }
             }
@@ -257,13 +259,13 @@ impl Controller {
                 self.next_refresh = Instant::now() + REFRESH_INTERVAL;
                 self.light_states = states
                     .into_iter()
-                    .map(|(id, on)| {
-                        let state = match on {
-                            Some(true) => LightState::On,
-                            Some(false) => LightState::Off,
+                    .map(|(id, reading)| {
+                        let state = match reading {
+                            Some(Reading { on: true, .. }) => LightState::On,
+                            Some(Reading { on: false, .. }) => LightState::Off,
                             None => LightState::Unreachable,
                         };
-                        (id, state)
+                        (id, (state, reading.map(|reading| reading.brightness)))
                     })
                     .collect();
             }
@@ -291,11 +293,12 @@ impl Controller {
         }
     }
 
-    fn tracked_addresses(&self, settings: &Settings) -> Vec<String> {
+    /// Tracked lights with the brightness the camera turns each on at
+    fn tracked_targets(&self, settings: &Settings) -> Vec<Target> {
         self.found
             .iter()
             .filter(|light| settings.is_tracked(&light.id))
-            .map(|light| light.address.clone())
+            .map(|light| (light.address.clone(), settings.brightness_for(&light.id)))
             .collect()
     }
 
@@ -327,7 +330,7 @@ impl Controller {
         self.flash_cancel = Some(cancel.clone());
 
         let lights = self.lights.clone();
-        let addresses = self.tracked_addresses(settings);
+        let addresses: Vec<String> = self.tracked_targets(settings).into_iter().map(|(address, _)| address).collect();
         let (count, interval) = (settings.flash_count, Duration::from_millis(settings.flash_interval_ms));
 
         let _ = thread::Builder::new()
@@ -386,20 +389,20 @@ impl Controller {
         self.publish_status(settings);
 
         if self.switch_deadline(settings).is_some_and(|deadline| Instant::now() >= deadline) {
-            let tracked = self.tracked_addresses(settings);
+            let tracked = self.tracked_targets(settings);
 
             log(format_args!("controller: switching {} lights on={}", tracked.len(), self.camera_on));
             let failed = self.lights.set_all_on(&tracked, self.camera_on);
             self.lights_camera_state = self.camera_on;
 
             // Retry once, only the lights that didn't respond, then leave them until the camera changes again
-            self.retry = (!failed.is_empty()).then(|| Retry { at: Instant::now() + RETRY_DELAY, addresses: failed });
+            self.retry = (!failed.is_empty()).then(|| Retry { at: Instant::now() + RETRY_DELAY, targets: failed });
 
             // Show the new light states right away
             self.next_refresh = Instant::now();
         } else if let Some(retry) = self.retry.take_if(|retry| Instant::now() >= retry.at) {
-            log(format_args!("controller: retrying {} lights", retry.addresses.len()));
-            self.lights.set_all_on(&retry.addresses, self.camera_on);
+            log(format_args!("controller: retrying {} lights", retry.targets.len()));
+            self.lights.set_all_on(&retry.targets, self.camera_on);
             self.next_refresh = Instant::now();
         }
 
@@ -471,7 +474,8 @@ impl Controller {
                     id: light.id.clone(),
                     name: light.name.clone(),
                     address: light.address.clone(),
-                    state: self.light_states.get(&light.id).copied().unwrap_or(LightState::Unknown),
+                    state: self.light_states.get(&light.id).map_or(LightState::Unknown, |(state, _)| *state),
+                    brightness: self.light_states.get(&light.id).and_then(|(_, brightness)| *brightness),
                     tracked: settings.is_tracked(&light.id),
                 })
                 .collect(),
@@ -504,7 +508,7 @@ impl Controller {
 
         let spawned = thread::Builder::new().name("light-refresh".into()).spawn(move || {
             let started = Instant::now();
-            let states = lights.are_on(&addresses);
+            let states = lights.read_all(&addresses);
             log(format_args!("refresh: {} lights took {}ms", addresses.len(), started.elapsed().as_millis()));
 
             let _ = events.send(Event::LightsRefreshed(ids.into_iter().zip(states).collect()));
