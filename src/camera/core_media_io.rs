@@ -152,6 +152,14 @@ fn name(device: ObjectId) -> Option<String> {
     }
 }
 
+/// Names of the connected cameras
+pub fn connected_cameras() -> Vec<String> {
+    let mut cameras: Vec<String> = devices().into_iter().filter_map(name).collect();
+    cameras.sort();
+    cameras.dedup();
+    cameras
+}
+
 /// Names of the cameras that are streaming
 pub fn streaming_cameras() -> Vec<String> {
     let mut cameras: Vec<String> = devices()

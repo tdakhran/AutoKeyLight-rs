@@ -131,8 +131,74 @@ function buildLightRows(lights) {
   }
 }
 
+// Connected cameras, listed when the window opens or the Camera tab is shown
+let connectedCameras = [];
+let renderedCameras = "";
+
+async function refreshCameras() {
+  try {
+    connectedCameras = await invoke("list_cameras");
+  } catch {
+    connectedCameras = [];
+  }
+  renderCameras();
+}
+
+function setCameraCounted(name, counted) {
+  const ignored = settings.ignoredCameras.filter((ignoredName) => ignoredName !== name);
+  saveSettings({ ignoredCameras: counted ? ignored : [...ignored, name] });
+}
+
+function renderCameras() {
+  if (!settings || !status) return;
+
+  // Unticked cameras stay listed when they're unplugged, so they can be ticked again
+  const names = [...new Set([...connectedCameras, ...status.cameras, ...settings.ignoredCameras])].sort();
+  const rows = names.map((name) => ({
+    name,
+    counted: countsCamera(name),
+    inUse: status.cameras.includes(name),
+    connected: connectedCameras.includes(name) || status.cameras.includes(name),
+  }));
+
+  // Only rebuild when something changed, so the checkboxes aren't replaced under the cursor
+  const key = JSON.stringify(rows);
+  if (key === renderedCameras) return;
+  renderedCameras = key;
+
+  const list = $("cameras");
+  list.replaceChildren();
+
+  for (const row of rows) {
+    const checkbox = document.createElement("input");
+    checkbox.type = "checkbox";
+    checkbox.checked = row.counted;
+    checkbox.addEventListener("change", () => setCameraCounted(row.name, checkbox.checked));
+
+    const name = document.createElement("span");
+    name.className = "name";
+    name.textContent = row.name;
+    name.title = row.name;
+
+    const note = document.createElement("span");
+    note.className = "state";
+    note.textContent = row.inUse ? "in use" : row.connected ? "" : "not connected";
+
+    const label = document.createElement("label");
+    label.append(checkbox, name, note);
+
+    const item = document.createElement("li");
+    item.classList.toggle("disabled", !row.counted);
+    item.append(label);
+    list.append(item);
+  }
+
+  $("no-cameras").hidden = rows.length > 0;
+}
+
 function renderSettings() {
   $("sync-brightness").checked = settings.syncBrightness;
+  $("ignore-when-locked").checked = settings.ignoreCameraWhenLocked;
   $("camera-enabled").checked = settings.cameraEnabled;
   $("calendar-enabled").checked = settings.calendarEnabled;
   $("on-delay").value = settings.cameraOnDelayMs;
@@ -199,6 +265,10 @@ function setStatusText(element, text, detail) {
   }
 }
 
+function countsCamera(name) {
+  return !settings?.ignoredCameras.includes(name);
+}
+
 function renderStatus() {
   const dot = $("camera-dot");
 
@@ -207,9 +277,17 @@ function renderStatus() {
     setStatusText($("camera-state"), "Camera detection isn't supported on this system");
   } else {
     dot.className = `dot ${status.cameraOn ? "on" : "off"}`;
-    const text = status.cameraOn ? `Camera is on: ${status.cameras.join(", ")}` : "Camera is off";
-    setStatusText($("camera-state"), text, settings && !settings.cameraEnabled ? "Lights don't follow the camera" : "");
+    const counted = status.cameras.filter(countsCamera);
+    const ignored = status.cameras.filter((name) => !countsCamera(name));
+    const text = status.cameraOn ? `Camera is on: ${counted.join(", ")}` : "Camera is off";
+
+    let detail = "";
+    if (settings && !settings.cameraEnabled) detail = "Lights don't follow the camera";
+    else if (!status.cameraOn && ignored.length > 0) detail = `${ignored.join(", ")} in use, not counted`;
+    setStatusText($("camera-state"), text, detail);
   }
+
+  renderCameras();
 
   renderLights();
   renderCalendar();
@@ -229,6 +307,10 @@ function readNumber(input, min, max) {
   input.value = value;
   return value;
 }
+
+$("ignore-when-locked").addEventListener("change", (event) =>
+  saveSettings({ ignoreCameraWhenLocked: event.target.checked }),
+);
 
 $("sync-brightness").addEventListener("change", (event) => {
   const changes = { syncBrightness: event.target.checked };
@@ -289,7 +371,15 @@ function showTab(id) {
   } catch {}
 }
 
-for (const tab of document.querySelectorAll(".tab")) tab.addEventListener("click", () => showTab(tab.dataset.tab));
+// Cameras may have been plugged in or out while the window was in the background
+window.addEventListener("focus", refreshCameras);
+
+for (const tab of document.querySelectorAll(".tab")) {
+  tab.addEventListener("click", () => {
+    showTab(tab.dataset.tab);
+    if (tab.dataset.tab === "camera-tab") refreshCameras();
+  });
+}
 
 let savedTab = null;
 try {
@@ -323,6 +413,7 @@ $("repository").addEventListener("click", (event) => {
   $("repository").title = about.repository;
 
   settings = await invoke("get_settings");
+  refreshCameras();
   status = await invoke("get_status");
   $("autostart").checked = await invoke("get_autostart");
   renderSettings();

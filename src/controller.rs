@@ -29,6 +29,9 @@ pub const MAIN_WINDOW: &str = "main";
 /// How often light states are refreshed while the window is open
 const REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 const RETRY_DELAY: Duration = Duration::from_secs(1);
+/// Cameras are ignored this long after the computer was last seen locked, face recognition at login (Windows Hello)
+/// keeps streaming for a moment after unlocking
+const UNLOCK_GRACE: Duration = Duration::from_secs(5);
 /// How soon the calendar is loaded again after it failed to, unless the refresh period is shorter
 const CALENDAR_RETRY_INTERVAL: Duration = Duration::from_secs(5 * 60);
 /// A meeting is still reminded of this long after its start, for example right after waking from sleep
@@ -122,6 +125,7 @@ pub fn spawn(app: AppHandle, shared: Arc<Shared>, camera_supported: bool, events
         camera_changed_at: Instant::now(),
         lights_camera_state: false,
         retry: None,
+        ignore_cameras_until: None,
         window_open: false,
         refreshing: false,
         next_refresh: Instant::now(),
@@ -162,6 +166,8 @@ struct Controller {
     /// Camera state the lights were last switched for, starts as off so the lights are only touched once the camera turns on
     lights_camera_state: bool,
     retry: Option<Retry>,
+    /// Set while the computer is locked and shortly after, cameras don't count until then
+    ignore_cameras_until: Option<Instant>,
     window_open: bool,
     /// Whether a background refresh of the light states is running
     refreshing: bool,
@@ -212,17 +218,8 @@ impl Controller {
         match event {
             Event::Camera(cameras) => {
                 log(format_args!("controller: camera event {cameras:?}"));
-                let on = !cameras.is_empty();
+                // Whether it turns the lights on depends on which cameras count, decided in `update`
                 self.cameras = cameras;
-
-                if on != self.camera_on {
-                    self.camera_on = on;
-                    self.camera_changed_at = Instant::now();
-                    // A pending retry was for the previous camera state
-                    self.retry = None;
-                    // The camera wins over a reminder, restoring the lights afterwards would undo the switch
-                    self.cancel_flash();
-                }
             }
             Event::LightFound(light) => {
                 match self.found.iter_mut().find(|found| found.id == light.id) {
@@ -367,14 +364,35 @@ impl Controller {
         let refresh = (self.window_open && !self.refreshing).then_some(self.next_refresh);
         let retry = self.retry.as_ref().map(|retry| retry.at);
         let calendar_load = (!self.calendar_url.is_empty() && !self.calendar_loading).then_some(self.next_calendar_load);
+        // Check the camera again once cameras stop being ignored after unlocking
+        let unlock_grace = self.ignore_cameras_until.filter(|until| !self.cameras.is_empty() && *until > Instant::now());
 
-        [self.switch_deadline(settings), retry, refresh, calendar_load, self.next_meeting_deadline()]
+        [self.switch_deadline(settings), retry, refresh, calendar_load, self.next_meeting_deadline(), unlock_grace]
             .into_iter()
             .flatten()
             .min()
     }
 
     fn update(&mut self, settings: &Settings) {
+        // Logging in with face recognition uses the camera, that mustn't turn the lights on. Only checked while a camera
+        // is streaming
+        let now = Instant::now();
+        if settings.ignore_camera_when_locked && !self.cameras.is_empty() && crate::lock::is_locked() {
+            self.ignore_cameras_until = Some(now + UNLOCK_GRACE);
+        }
+        let ignoring = self.ignore_cameras_until.is_some_and(|until| now < until);
+
+        // Checked on every update, so unticking a camera that's in use applies right away
+        let camera_on = !ignoring && self.cameras.iter().any(|camera| settings.counts_camera(camera));
+        if camera_on != self.camera_on {
+            self.camera_on = camera_on;
+            self.camera_changed_at = Instant::now();
+            // A pending retry was for the previous camera state
+            self.retry = None;
+            // The camera wins over a reminder, restoring the lights afterwards would undo the switch
+            self.cancel_flash();
+        }
+
         // Only starts background work, so it doesn't hold up the status below
         self.update_calendar(settings);
 

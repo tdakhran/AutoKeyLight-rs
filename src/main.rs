@@ -72,6 +72,12 @@ fn update_settings(shared: State<'_, Arc<Shared>>, settings: Settings) -> Result
     Ok(settings)
 }
 
+/// Names of the connected cameras, for choosing which ones count
+#[tauri::command]
+async fn list_cameras() -> Vec<String> {
+    camera::connected_cameras()
+}
+
 /// Blinks the tracked lights now, to try the meeting reminder
 #[tauri::command]
 fn flash_lights(shared: State<'_, Arc<Shared>>) {
@@ -171,7 +177,8 @@ fn main() {
             set_autostart,
             get_about,
             open_repository,
-            flash_lights
+            flash_lights,
+            list_cameras
         ])
         .setup(|app| {
             let settings_path = app.path().app_config_dir()?.join("settings.json");

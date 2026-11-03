@@ -4,16 +4,17 @@
 //! so we ask Media Foundation which processes are streaming instead.
 //! https://learn.microsoft.com/en-us/windows/win32/api/mfidl/nn-mfidl-imfsensoractivitymonitor
 
-use std::sync::{mpsc, Mutex};
+use std::sync::{mpsc, Mutex, Once};
 use std::thread;
 
 use windows::Win32::Media::MediaFoundation::{
-    IMFSensorActivitiesReport, IMFSensorActivitiesReportCallback,
-    IMFSensorActivitiesReportCallback_Impl, IMFSensorActivityMonitor, IMFSensorActivityReport,
-    MFCreateSensorActivityMonitor, MFStartup, MFSTARTUP_FULL, MF_VERSION,
+    IMFActivate, IMFAttributes, IMFSensorActivitiesReport, IMFSensorActivitiesReportCallback,
+    IMFSensorActivitiesReportCallback_Impl, IMFSensorActivityMonitor, IMFSensorActivityReport, MFCreateAttributes,
+    MFCreateSensorActivityMonitor, MFEnumDeviceSources, MFStartup, MFSTARTUP_FULL, MF_DEVSOURCE_ATTRIBUTE_FRIENDLY_NAME,
+    MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE, MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_GUID, MF_VERSION,
 };
-use windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
-use windows_core::{implement, Ref, Result};
+use windows::Win32::System::Com::{CoInitializeEx, CoTaskMemFree, COINIT_MULTITHREADED};
+use windows_core::{implement, Ref, Result, PWSTR};
 
 type OnChange = Box<dyn Fn(Vec<String>) + Send + Sync>;
 
@@ -72,6 +73,53 @@ fn friendly_name(device: &IMFSensorActivityReport) -> Result<String> {
 
     let length = name.iter().position(|&c| c == 0).unwrap_or(name.len());
     Ok(String::from_utf16_lossy(&name[..length]))
+}
+
+/// Names of the connected cameras. Lists them without opening them, so it doesn't count as using a camera.
+pub fn connected_cameras() -> Vec<String> {
+    static STARTUP: Once = Once::new();
+
+    unsafe {
+        // Fails harmlessly when the thread already set up COM differently, enumerating works either way
+        let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+        STARTUP.call_once(|| {
+            let _ = MFStartup(MF_VERSION, MFSTARTUP_FULL);
+        });
+    }
+
+    let mut cameras = enumerate_cameras().unwrap_or_default();
+    cameras.sort();
+    cameras.dedup();
+    cameras
+}
+
+fn enumerate_cameras() -> Result<Vec<String>> {
+    unsafe {
+        let mut attributes: Option<IMFAttributes> = None;
+        MFCreateAttributes(&mut attributes, 1)?;
+        let attributes = attributes.ok_or_else(windows_core::Error::empty)?;
+        attributes.SetGUID(&MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE, &MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_GUID)?;
+
+        let mut devices: *mut Option<IMFActivate> = std::ptr::null_mut();
+        let mut count = 0u32;
+        MFEnumDeviceSources(&attributes, &mut devices, &mut count)?;
+
+        let mut names = Vec::new();
+        for index in 0..count as usize {
+            // Taking each one releases it when it goes out of scope
+            if let Some(device) = (*devices.add(index)).take() {
+                let mut name = PWSTR::null();
+                let mut length = 0u32;
+                if device.GetAllocatedString(&MF_DEVSOURCE_ATTRIBUTE_FRIENDLY_NAME, &mut name, &mut length).is_ok() {
+                    names.push(name.to_string().unwrap_or_default());
+                    CoTaskMemFree(Some(name.0.cast()));
+                }
+            }
+        }
+        CoTaskMemFree(Some(devices.cast()));
+
+        Ok(names)
+    }
 }
 
 fn start_monitor(on_change: OnChange) -> Result<IMFSensorActivityMonitor> {

@@ -20,6 +20,10 @@ pub struct Settings {
     pub brightness: Option<u8>,
     /// Switch the tracked lights with the camera
     pub camera_enabled: bool,
+    /// Names of cameras whose use doesn't count, new cameras count
+    pub ignored_cameras: Vec<String>,
+    /// Ignore cameras while the computer is locked, so face recognition at login doesn't turn the lights on
+    pub ignore_camera_when_locked: bool,
     pub camera_on_delay_ms: u64,
     pub camera_off_delay_ms: u64,
     /// iCal (ICS) link of the calendar to remind of meetings from, the tracked lights blink when a meeting starts.
@@ -41,6 +45,8 @@ impl Default for Settings {
             sync_brightness: true,
             brightness: Some(20),
             camera_enabled: true,
+            ignored_cameras: Vec::new(),
+            ignore_camera_when_locked: false,
             camera_on_delay_ms: 0,
             camera_off_delay_ms: 0,
             calendar_url: String::new(),
@@ -89,6 +95,11 @@ impl Settings {
         } else {
             self.light_brightness.get(id).copied()
         }
+    }
+
+    /// Whether this camera streaming turns the lights on
+    pub fn counts_camera(&self, name: &str) -> bool {
+        !self.ignored_cameras.iter().any(|ignored| ignored == name)
     }
 
     pub fn is_tracked(&self, id: &str) -> bool {
