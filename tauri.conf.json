@@ -16,6 +16,7 @@
         "resizable": false,
         "maximizable": false,
         "visible": false,
+        "create": false,
         "center": true
       }
     ],

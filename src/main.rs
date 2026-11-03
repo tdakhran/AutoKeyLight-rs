@@ -16,7 +16,7 @@ use tauri::image::Image;
 use serde::Serialize;
 use tauri::menu::{AboutMetadata, Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
-use tauri::{AppHandle, Manager, State, WindowEvent};
+use tauri::{AppHandle, Manager, RunEvent, State, WebviewWindowBuilder, WindowEvent};
 use tauri_plugin_autostart::{MacosLauncher, ManagerExt};
 use tauri_plugin_opener::OpenerExt;
 
@@ -108,12 +108,65 @@ fn notify(app: &AppHandle, event: Event) {
     }
 }
 
+/// Shows the settings window, creating it if it's closed. It's destroyed when closed, so the web view doesn't keep
+/// running while the app is in the tray.
 fn show_main_window(app: &AppHandle) {
-    if let Some(window) = app.get_webview_window(controller::MAIN_WINDOW) {
-        let _ = window.unminimize();
-        let _ = window.show();
-        let _ = window.set_focus();
-        notify(app, Event::WindowShown);
+    let window = match app.get_webview_window(controller::MAIN_WINDOW) {
+        Some(window) => window,
+        None => {
+            let Some(config) = app.config().app.windows.iter().find(|window| window.label == controller::MAIN_WINDOW)
+            else {
+                return;
+            };
+
+            // Before the web view's processes start, so they don't inherit the low priority
+            #[cfg(windows)]
+            set_efficiency_mode(false);
+
+            match WebviewWindowBuilder::from_config(app, config).and_then(|builder| builder.build()) {
+                Ok(window) => window,
+                Err(error) => {
+                    log::log(format_args!("window: couldn't create it: {error}"));
+                    return;
+                }
+            }
+        }
+    };
+
+    let _ = window.unminimize();
+    let _ = window.show();
+    let _ = window.set_focus();
+    notify(app, Event::WindowShown);
+}
+
+/// Windows 11's efficiency mode while the app waits in the tray: throttled to efficient cores (EcoQoS) at low
+/// priority, like Task Manager's own toggle. Turned off while the window is open, processes started meanwhile inherit
+/// the priority, the web view's included, and the window would feel sluggish when the CPU is busy.
+#[cfg(windows)]
+fn set_efficiency_mode(enabled: bool) {
+    use std::ffi::c_void;
+    use windows::Win32::System::Threading::{
+        GetCurrentProcess, ProcessPowerThrottling, SetPriorityClass, SetProcessInformation, IDLE_PRIORITY_CLASS,
+        NORMAL_PRIORITY_CLASS, PROCESS_POWER_THROTTLING_CURRENT_VERSION, PROCESS_POWER_THROTTLING_EXECUTION_SPEED,
+        PROCESS_POWER_THROTTLING_STATE,
+    };
+
+    let state = PROCESS_POWER_THROTTLING_STATE {
+        Version: PROCESS_POWER_THROTTLING_CURRENT_VERSION,
+        ControlMask: PROCESS_POWER_THROTTLING_EXECUTION_SPEED,
+        StateMask: if enabled { PROCESS_POWER_THROTTLING_EXECUTION_SPEED } else { 0 },
+    };
+
+    unsafe {
+        let throttling = SetProcessInformation(
+            GetCurrentProcess(),
+            ProcessPowerThrottling,
+            (&state as *const PROCESS_POWER_THROTTLING_STATE).cast::<c_void>(),
+            std::mem::size_of::<PROCESS_POWER_THROTTLING_STATE>() as u32,
+        );
+        let priority =
+            SetPriorityClass(GetCurrentProcess(), if enabled { IDLE_PRIORITY_CLASS } else { NORMAL_PRIORITY_CLASS });
+        log::log(format_args!("efficiency mode {enabled}: throttling {throttling:?}, priority {priority:?}"));
     }
 }
 
@@ -204,6 +257,9 @@ fn main() {
             build_tray(app.handle())?;
             controller::spawn(app.handle().clone(), shared, camera_supported, events_receiver);
 
+            #[cfg(windows)]
+            set_efficiency_mode(true);
+
             if !std::env::args().any(|arg| arg == MINIMIZED_ARG) {
                 show_main_window(app.handle());
             }
@@ -211,13 +267,21 @@ fn main() {
             Ok(())
         })
         .on_window_event(|window, event| {
-            // Closing the window keeps the app running in the tray
-            if let WindowEvent::CloseRequested { api, .. } = event {
-                api.prevent_close();
-                let _ = window.hide();
+            if let WindowEvent::Destroyed = event {
                 notify(window.app_handle(), Event::WindowHidden);
+
+                // Back in the tray
+                #[cfg(windows)]
+                set_efficiency_mode(true);
             }
         })
-        .run(tauri::generate_context!())
-        .expect("error while running AutoKeyLight");
+        .build(tauri::generate_context!())
+        .expect("error while building AutoKeyLight")
+        .run(|_app, event| {
+            // Closing the window closes the last one, the app keeps running in the tray. Exit from the tray menu
+            // exits with a code and isn't stopped
+            if let RunEvent::ExitRequested { api, code: None, .. } = event {
+                api.prevent_exit();
+            }
+        });
 }
